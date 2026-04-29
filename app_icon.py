@@ -54,27 +54,69 @@ def _render_pixmap(size: int) -> QPixmap:
 
     # The "K" — drawn as a vector path so its bounding rect is reliable
     # regardless of platform/font-rasterizer state (matters on CI / offscreen).
+    # Try the real font first; fall back to a hand-drawn geometric K if Qt
+    # has no fonts available (e.g. the offscreen platform plugin) and is
+    # returning a placeholder square instead of a real glyph outline.
     font = QFont("Segoe UI", max(6, round(34 * s)), QFont.Weight.Bold)
-    path = QPainterPath()
-    path.addText(0.0, 0.0, font, "K")
-    br = path.boundingRect()
-    if br.isEmpty():
-        # Fallback: any sans-serif bold the system has.
+    path = _glyph_path(font, "K")
+    if path is None:
         font = QFont()
         font.setBold(True)
         font.setPointSizeF(max(6.0, 34 * s))
-        path = QPainterPath()
-        path.addText(0.0, 0.0, font, "K")
+        path = _glyph_path(font, "K")
+
+    if path is not None:
         br = path.boundingRect()
-    path.translate(
-        rect.center().x() - br.center().x(),
-        rect.center().y() - br.center().y(),
-    )
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#555"))
-    painter.drawPath(path)
+        path.translate(
+            rect.center().x() - br.center().x(),
+            rect.center().y() - br.center().y(),
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#555"))
+        painter.drawPath(path)
+    else:
+        _draw_geometric_k(painter, rect, s)
+
     painter.end()
     return pix
+
+
+def _glyph_path(font: QFont, char: str) -> QPainterPath | None:
+    """Return a path for ``char`` rendered with ``font``, or None if Qt's
+    font system can only produce a placeholder rectangle (which happens
+    when no real font files are available, e.g. offscreen mode on CI).
+    """
+    path = QPainterPath()
+    path.addText(0.0, 0.0, font, char)
+    if path.isEmpty():
+        return None
+    # A real glyph outline has many path elements (lines + curves). Qt's
+    # missing-glyph placeholder is a simple rectangle (~5 elements).
+    if path.elementCount() < 10:
+        return None
+    return path
+
+
+def _draw_geometric_k(painter: QPainter, rect: QRectF, s: float) -> None:
+    """Render the letter K from primitive lines, no font required."""
+    pen = QPen(QColor("#555"))
+    pen.setWidthF(max(2.0, 6 * s))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    cx, cy = rect.center().x(), rect.center().y()
+    half_h = rect.height() * 0.28
+    stem_x = cx - rect.width() * 0.14
+    arm_x = cx + rect.width() * 0.20
+
+    painter.drawLine(int(stem_x), int(cy - half_h),
+                     int(stem_x), int(cy + half_h))
+    painter.drawLine(int(stem_x), int(cy),
+                     int(arm_x), int(cy - half_h))
+    painter.drawLine(int(stem_x), int(cy),
+                     int(arm_x), int(cy + half_h))
 
 
 def make_icon() -> QIcon:

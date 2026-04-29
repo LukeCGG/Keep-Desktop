@@ -42,8 +42,9 @@ jobs:
 
       - name: Generate icon.ico
         shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
+        # Use the real Windows Qt platform plugin (not "offscreen") so the
+        # font system has access to GDI fonts like Segoe UI. The offscreen
+        # plugin ships with no fonts and renders text as empty glyphs.
         run: python tools/generate_icon.py
 
       - name: Build with PyInstaller
