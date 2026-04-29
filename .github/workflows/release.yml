@@ -40,6 +40,12 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Building version $v"
 
+      - name: Generate icon.ico
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/generate_icon.py
+
       - name: Build with PyInstaller
         shell: pwsh
         run: pyinstaller --noconfirm KeepDesktop.spec
