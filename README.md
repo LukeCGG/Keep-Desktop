@@ -28,12 +28,11 @@ Run it, click through, done. KeepDesktop will be in your Start menu and (optiona
 
 ## Connecting Google Keep
 
-1. Go to [Google Account → Security → App passwords](https://myaccount.google.com/apppasswords)
-2. Create an app password (select "Other", name it "KeepDesktop")
-3. Right-click the tray icon → **Sign in to Google Keep**
-4. Enter your Gmail and the 16-character app password
+1. Right-click the tray icon → **Sign in to Google Keep**
+2. A Google sign-in window opens — enter your Google account credentials and complete any 2-Step Verification prompts as normal.
+3. Once you're signed in, the window closes automatically and your Keep notes start appearing as floating windows.
 
-> You need 2-Step Verification enabled on your Google account to create app passwords.
+No app passwords required. KeepDesktop never sees your password — Google issues a long-lived master token to the embedded sign-in flow, and only that token is stored locally (in `%APPDATA%\KeepDesktop\keep_token.dat`). You can revoke access at any time from your [Google Account → Security → Your devices](https://myaccount.google.com/device-activity) page.
 
 ## Usage
 

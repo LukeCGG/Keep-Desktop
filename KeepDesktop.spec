@@ -11,15 +11,26 @@
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import copy_metadata
+
 block_cipher = None
 
 project_root = Path(SPECPATH).resolve()
+
+# Packages that call importlib.metadata.version(__name__) at import time.
+# Their .dist-info folders must be bundled or the import will crash.
+_metadata = []
+for pkg in ("gpsoauth", "gkeepapi", "requests", "urllib3"):
+    try:
+        _metadata += copy_metadata(pkg)
+    except Exception:
+        pass
 
 a = Analysis(
     ['main.py'],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[],
+    datas=_metadata,
     hiddenimports=[
         'PySide6.QtWebEngineCore',
         'PySide6.QtWebEngineWidgets',
