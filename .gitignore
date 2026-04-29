@@ -1,0 +1,36 @@
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# ── PyInstaller ────────────────────────────────────────────────
+build/
+dist/
+*.manifest
+
+# ── Inno Setup ─────────────────────────────────────────────────
+Output/
+
+# ── IDE ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ─────────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ── KeepDesktop local state (just in case) ─────────────────────
+*.dat
+keep_token.dat
+notes.json
+positions.json
+config.json
