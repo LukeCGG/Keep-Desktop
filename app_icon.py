@@ -5,7 +5,7 @@ Used by the tray, all windows/dialogs, and (via icon.ico) the Windows EXE.
 
 from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import (
-    QIcon, QPixmap, QPainter, QColor, QFont, QFontMetricsF, QPainterPath, QPen,
+    QIcon, QPixmap, QPainter, QColor, QFont, QPainterPath, QPen,
 )
 
 
@@ -52,15 +52,27 @@ def _render_pixmap(size: int) -> QPixmap:
         y += spacing
     painter.restore()
 
-    # The "K", visually centered using the glyph's tight bounding rect.
+    # The "K" — drawn as a vector path so its bounding rect is reliable
+    # regardless of platform/font-rasterizer state (matters on CI / offscreen).
     font = QFont("Segoe UI", max(6, round(34 * s)), QFont.Weight.Bold)
-    painter.setFont(font)
-    painter.setPen(QColor("#555"))
-    fm = QFontMetricsF(font)
-    tight = fm.tightBoundingRect("K")
-    tx = rect.center().x() - tight.center().x()
-    ty = rect.center().y() - tight.center().y()
-    painter.drawText(int(round(tx)), int(round(ty)), "K")
+    path = QPainterPath()
+    path.addText(0.0, 0.0, font, "K")
+    br = path.boundingRect()
+    if br.isEmpty():
+        # Fallback: any sans-serif bold the system has.
+        font = QFont()
+        font.setBold(True)
+        font.setPointSizeF(max(6.0, 34 * s))
+        path = QPainterPath()
+        path.addText(0.0, 0.0, font, "K")
+        br = path.boundingRect()
+    path.translate(
+        rect.center().x() - br.center().x(),
+        rect.center().y() - br.center().y(),
+    )
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#555"))
+    painter.drawPath(path)
     painter.end()
     return pix
 

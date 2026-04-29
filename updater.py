@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import threading
@@ -146,37 +145,47 @@ def download_installer(url: str, progress_cb=None) -> str | None:
 
 
 def run_installer_and_quit(installer_path: str) -> bool:
-    """Launch the installer in silent mode and quit the app.
+    """Launch the installer (with UAC if needed) and quit the app.
 
-    The Inno Setup script is configured to:
-      * run silently with /VERYSILENT
-      * close the running app and restart it after install (/CLOSEAPPLICATIONS /RESTARTAPPLICATIONS)
-      * delete itself afterwards (CLEANUP done by Inno's TEMP behaviour)
+    Uses ShellExecuteW so the installer's embedded manifest can trigger
+    UAC when the existing install lives in Program Files. /SILENT (not
+    /VERYSILENT) so the user sees the progress bar; we deliberately do
+    not pass /SUPPRESSMSGBOXES so failures are visible.
     """
     if not os.path.isfile(installer_path):
         return False
-    args = [
-        installer_path,
-        "/VERYSILENT",
-        "/SUPPRESSMSGBOXES",
+
+    params = " ".join([
+        "/SILENT",
         "/NORESTART",
         "/CLOSEAPPLICATIONS",
         "/RESTARTAPPLICATIONS",
-    ]
+    ])
+
     try:
-        # DETACHED_PROCESS so the installer survives our exit.
-        DETACHED = 0x00000008
-        subprocess.Popen(  # noqa: S603
-            args,
-            creationflags=DETACHED,
-            close_fds=True,
+        import ctypes
+        from ctypes import wintypes
+
+        SW_SHOWNORMAL = 1
+        # ShellExecuteW honours the installer's manifest -> UAC prompt
+        # appears automatically if elevation is required. Verb=None lets
+        # Windows pick the default ("open"); use "runas" to force UAC.
+        ShellExecuteW = ctypes.windll.shell32.ShellExecuteW
+        ShellExecuteW.restype = wintypes.HINSTANCE
+        result = ShellExecuteW(
+            None, None, installer_path, params, None, SW_SHOWNORMAL
         )
+        # Return value > 32 means success; <= 32 is a SE_ERR_* code.
+        if int(result) <= 32:
+            log.error("ShellExecuteW failed with code %s", int(result))
+            return False
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to launch installer: %s", exc)
         return False
 
-    # Quit the GUI so the installer can replace the binary.
-    QTimer.singleShot(200, QApplication.instance().quit)
+    # Give Inno a moment to spin up (and for the user to confirm UAC if
+    # needed) before quitting, so it can take over our running EXE.
+    QTimer.singleShot(2500, QApplication.instance().quit)
     return True
 
 
