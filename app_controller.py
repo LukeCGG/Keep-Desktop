@@ -21,6 +21,7 @@ from config import (
     SYNC_INTERVAL_MS, DATA_DIR, load_token,
     load_json, save_json, APP_NAME, APP_VERSION, GITHUB_REPO,
 )
+from app_icon import make_icon as _make_icon
 from note_window import NoteWindow
 from keep_sync import KeepSync, KeepNote
 from updater import UpdateChecker, prompt_and_install
@@ -36,21 +37,6 @@ def _load_visibility() -> dict:
 
 def _save_visibility(vis: dict):
     save_json(VISIBILITY_FILE, vis)
-
-
-def _make_icon():
-    pix = QPixmap(64, 64)
-    pix.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#FFF475"))
-    painter.setPen(QColor("#E0D85A"))
-    painter.drawRoundedRect(4, 4, 56, 56, 12, 12)
-    painter.setPen(QColor("#555"))
-    painter.setFont(QFont("Segoe UI", 28, QFont.Weight.Bold))
-    painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "K")
-    painter.end()
-    return QIcon(pix)
 
 
 def _escape_html(text):
