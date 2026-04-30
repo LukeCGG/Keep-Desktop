@@ -1013,7 +1013,13 @@ class AppController(QObject):
             self._full_sync()
             self._sync_timer.start(SYNC_INTERVAL_MS)
             self._update_login_action_text()
+            # Open the manager so the user can pick which notes to show.
+            QTimer.singleShot(500, self._show_note_manager_if_not_open)
         return ok
+
+    def _show_note_manager_if_not_open(self):
+        if not self._manager_dialog_open():
+            self._show_note_manager()
 
     def _first_launch_login(self):
         dlg = LoginDialog(first_launch=True)
@@ -1027,6 +1033,7 @@ class AppController(QObject):
             self._full_sync()
             self._sync_timer.start(SYNC_INTERVAL_MS)
             self._update_login_action_text()
+            QTimer.singleShot(500, self._show_note_manager_if_not_open)
         else:
             if not self.windows:
                 self._new_note()
@@ -1050,6 +1057,7 @@ class AppController(QObject):
             self._sync_timer.start(SYNC_INTERVAL_MS)
             self._update_login_action_text()
             QMessageBox.information(None, "KeepDesktop", "Signed in! Your notes are syncing.")
+            QTimer.singleShot(500, self._show_note_manager_if_not_open)
 
     def _full_sync(self):
         if not self.sync.is_authenticated:
@@ -1076,15 +1084,19 @@ class AppController(QObject):
         """Apply remote note data on the main thread."""
         log.info("Applying %d remote notes (local dirty=%s)",
                  len(remote_notes), [d[:8] for d in self._dirty])
+        new_remote_ids: list[str] = []
         for rn in remote_notes:
             existing = self._notes.get(rn.id)
             if existing is None:
                 log.info("New remote note %s title=%r", rn.id[:8], rn.title)
                 self._notes[rn.id] = rn
                 if rn.id not in self._visibility:
-                    self._visibility[rn.id] = True
+                    # New notes coming in from another device are hidden
+                    # by default — the user opts in via the Note Manager.
+                    self._visibility[rn.id] = False
                     _save_visibility(self._visibility)
-                if self._visibility.get(rn.id, True):
+                    new_remote_ids.append(rn.id)
+                if self._visibility.get(rn.id, False):
                     self._add_window_for_note(rn)
             else:
                 # Update sort/pin info always
@@ -1147,6 +1159,19 @@ class AppController(QObject):
 
         self._save_notes_to_disk()
         self._refresh_manager_if_open()
+
+        # If new remote notes arrived (e.g. created on another device)
+        # and no notes are currently visible, surface the manager so the
+        # user can opt them in. We only auto-open it for *new* notes
+        # that the user hasn't seen before.
+        if new_remote_ids and not self._manager_dialog_open():
+            visible_count = sum(1 for v in self._visibility.values() if v)
+            if visible_count == 0:
+                QTimer.singleShot(0, self._show_note_manager)
+
+    def _manager_dialog_open(self) -> bool:
+        dlg = getattr(self, "_manager_dlg", None)
+        return dlg is not None and dlg.isVisible()
 
     def _push_dirty_notes(self):
         if not self.sync.is_authenticated or not self._dirty:

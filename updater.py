@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, Signal, Slot, QTimer
+from PySide6.QtCore import Qt, QObject, Signal, Slot, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from config import APP_NAME, APP_VERSION, GITHUB_REPO
@@ -171,13 +171,27 @@ def run_installer_and_quit(installer_path: str) -> bool:
         # appears automatically if elevation is required. Verb=None lets
         # Windows pick the default ("open"); use "runas" to force UAC.
         ShellExecuteW = ctypes.windll.shell32.ShellExecuteW
+        # IMPORTANT: declare argtypes so Python str is correctly converted
+        # to wide (UTF-16) strings. Without this, ctypes passes ANSI
+        # bytes to the *W* function and the path is silently mangled,
+        # making ShellExecuteW return SE_ERR_FNF (2) without launching
+        # anything — which looks to the user like the updater hangs.
+        ShellExecuteW.argtypes = [
+            wintypes.HWND,    # hwnd
+            wintypes.LPCWSTR, # lpOperation (verb)
+            wintypes.LPCWSTR, # lpFile
+            wintypes.LPCWSTR, # lpParameters
+            wintypes.LPCWSTR, # lpDirectory
+            ctypes.c_int,     # nShowCmd
+        ]
         ShellExecuteW.restype = wintypes.HINSTANCE
         result = ShellExecuteW(
             None, None, installer_path, params, None, SW_SHOWNORMAL
         )
         # Return value > 32 means success; <= 32 is a SE_ERR_* code.
-        if int(result) <= 32:
-            log.error("ShellExecuteW failed with code %s", int(result))
+        rc = int(result)
+        if rc <= 32:
+            log.error("ShellExecuteW failed with code %s for %s", rc, installer_path)
             return False
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to launch installer: %s", exc)
@@ -223,6 +237,29 @@ class UpdateChecker(QObject):
             self.no_update.emit()
 
 
+def _notes_to_html(markdown: str) -> str:
+    """Tiny markdown->HTML for the release-notes preview.
+
+    Handles bare URLs and `[text](url)` links so the changelog link in
+    GitHub's auto-generated notes is actually clickable.
+    """
+    import html
+    text = html.escape(markdown)
+    # [text](url) → <a href="url">text</a>
+    text = re.sub(
+        r'\[([^\]]+)\]\((https?://[^)\s]+)\)',
+        r'<a href="\2">\1</a>',
+        text,
+    )
+    # Bare URLs (skip ones already inside an href="...")
+    text = re.sub(
+        r'(?<!")(?<!=)(https?://[^\s<)]+)',
+        r'<a href="\1">\1</a>',
+        text,
+    )
+    return text.replace("\n", "<br>")
+
+
 def prompt_and_install(parent, info: ReleaseInfo):
     """Ask the user whether to install the new version, then do it."""
     short_notes = (info.notes or "").strip()
@@ -232,12 +269,19 @@ def prompt_and_install(parent, info: ReleaseInfo):
     msg = QMessageBox(parent)
     msg.setIcon(QMessageBox.Icon.Information)
     msg.setWindowTitle(f"{APP_NAME} update available")
+    msg.setTextFormat(Qt.TextFormat.RichText)
     msg.setText(
         f"<b>{APP_NAME} {info.version}</b> is available."
         f"<br>(You're on {APP_VERSION}.)"
     )
     if short_notes:
-        msg.setInformativeText("Release notes:\n\n" + short_notes)
+        msg.setInformativeText(
+            "<b>Release notes</b><br><br>" + _notes_to_html(short_notes)
+        )
+    # Allow links in the dialog to be clicked / opened in browser.
+    msg.setTextInteractionFlags(
+        Qt.TextInteractionFlag.TextBrowserInteraction
+    )
     msg.setStandardButtons(
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
     )
