@@ -905,9 +905,12 @@ class AppController(QObject):
             if self._visibility.get(note_id, True):
                 win = self._create_window(note)
                 self.windows[note_id] = win
+                # Set per-window AppUserModelID *before* first show; the
+                # taskbar reads this property when the button is created
+                # and ignores later changes unless the window is hidden
+                # and shown again.
+                self._apply_grouping_for_window(note_id, win)
                 win.show()
-        # Group/ungroup once all initial windows have HWNDs.
-        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     # ── Note management ────────────────────────────────────────────────
 
@@ -937,11 +940,11 @@ class AppController(QObject):
 
         win = self._create_window(note)
         self.windows[note_id] = win
+        self._apply_grouping_for_window(note_id, win)
         win.show()
 
         if self.sync.is_authenticated:
             threading.Thread(target=self._push_new_note, args=(note,), daemon=True).start()
-        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     def _push_new_note(self, note: KeepNote):
         result = self.sync.create_note(note.title, note.text, note.color_hex)
@@ -1184,26 +1187,38 @@ class AppController(QObject):
         save_config(self.config)
         self._apply_taskbar_grouping()
 
-    def _apply_taskbar_grouping(self):
-        """Set per-window AppUserModelID so Windows groups (or doesn't)
-        the notes in the taskbar.
-
-        When grouping is ON: every note shares the process-level app id
-        and they all stack under one icon.
-        When grouping is OFF: each note gets a unique app id so Windows
-        treats it as its own pinned program.
-        """
+    def _grouping_app_id_for(self, note_id: str) -> str:
         from config import APP_NAME, APP_VERSION
-        group = self.config.get("group_in_taskbar", True)
         base = f"LukeCGG.{APP_NAME}.{APP_VERSION}"
-        for nid, win in self.windows.items():
-            try:
-                if group:
-                    _set_window_app_id(win, base)
-                else:
-                    _set_window_app_id(win, f"{base}.note.{nid[:12]}")
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Couldn't set per-window app id: %s", exc)
+        if self.config.get("group_in_taskbar", True):
+            return base
+        # Stable per-note id so taskbar pins survive restarts.
+        return f"{base}.note.{note_id[:12]}"
+
+    def _apply_grouping_for_window(self, note_id: str, win) -> None:
+        """Set the AppUserModelID on a single window. Safe to call before
+        the window is shown (preferred) or after.
+        """
+        try:
+            _set_window_app_id(win, self._grouping_app_id_for(note_id))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Couldn't set per-window app id: %s", exc)
+
+    def _apply_taskbar_grouping(self):
+        """Update every visible note's per-window AppUserModelID and
+        force Windows to rebuild the taskbar buttons by hiding/showing
+        each window. Without the re-show, the taskbar keeps the old
+        grouping until the next launch.
+        """
+        for nid, win in list(self.windows.items()):
+            was_visible = win.isVisible()
+            if was_visible:
+                # hide() destroys the taskbar button so the next show()
+                # re-registers it under the new AppID.
+                win.hide()
+            self._apply_grouping_for_window(nid, win)
+            if was_visible:
+                win.show()
 
     # ── Sign in / Sign out ─────────────────────────────────────────────
 
@@ -1475,9 +1490,9 @@ class AppController(QObject):
             return
         win = self._create_window(note)
         self.windows[note.id] = win
+        self._apply_grouping_for_window(note.id, win)
         if self._visibility.get(note.id, True):
             win.show()
-        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     def _refresh_window(self, note_id: str):
         win = self.windows.get(note_id)

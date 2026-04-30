@@ -63,7 +63,13 @@ Name: "{autodesktop}\{#MyAppName}";        Filename: "{app}\{#MyAppExeName}"; Ta
 Name: "{userstartup}\{#MyAppName}";        Filename: "{app}\{#MyAppExeName}"; Tasks: startup
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; nowait  -> don't block the installer waiting for the app
+; postinstall -> run as the very last step
+; runasoriginaluser -> if installer was elevated, launch the app as the
+;                      logged-in user so it doesn't run elevated forever
+; NOTE: deliberately NOT using `skipifsilent` so the auto-updater
+; (which runs us with /SILENT) still relaunches the new build.
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall runasoriginaluser
 
 [UninstallDelete]
 ; Leave user data (%APPDATA%\KeepDesktop) intact on uninstall — users can wipe it manually
