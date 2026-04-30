@@ -821,8 +821,13 @@ class AppController(QObject):
             note.title = win.get_title()
             note.color_hex = win.color_hex
             note.html = win.get_html()
+            # The window may have been toggled in/out of checklist mode
+            # by the user; pick that up so it persists.
+            note.is_list = bool(getattr(win, "_is_list", False))
             if note.is_list:
                 note.list_items = win.get_list_items()
+            else:
+                note.list_items = []
             self._dirty.add(note_id)
             # Debounce: save to disk in 1s, push to Keep in 5s
             self._save_debounce.start()
@@ -1108,11 +1113,16 @@ class AppController(QObject):
                     continue
                 # Detect what changed for diagnostics
                 changes = []
-                if existing.color_hex != rn.color_hex:
+                text_changed = (existing.text != rn.text)
+                title_changed = (existing.title != rn.title)
+                color_changed = (existing.color_hex != rn.color_hex)
+                list_changed = (existing.is_list != rn.is_list
+                                or existing.list_items != rn.list_items)
+                if color_changed:
                     changes.append(f"color {existing.color_hex}->{rn.color_hex}")
-                if existing.title != rn.title:
+                if title_changed:
                     changes.append("title")
-                if existing.text != rn.text:
+                if text_changed:
                     changes.append("text")
                 if existing.is_list != rn.is_list:
                     changes.append(f"is_list {existing.is_list}->{rn.is_list}")
@@ -1122,18 +1132,29 @@ class AppController(QObject):
                     )
                 if changes:
                     log.info("Note %s changed: %s", rn.id[:8], ", ".join(changes))
-                # Always overwrite local data with Keep data
+
+                # Always overwrite local data with Keep data EXCEPT html.
+                # Keep doesn't store rich-text formatting, so we keep the
+                # local html unless the plain text actually changed (in
+                # which case the local html is stale and would re-introduce
+                # outdated content).
                 existing.text = rn.text
                 existing.title = rn.title
-                existing.html = ""  # clear stale QTextEdit HTML
+                if text_changed:
+                    existing.html = ""  # text changed remotely — stale html
                 existing.color_hex = rn.color_hex
                 existing.list_items = rn.list_items
                 existing.is_list = rn.is_list
-                # Only refresh the window if user is NOT actively typing
+                # Only refresh the window if user is NOT actively typing,
+                # AND something visible actually changed. A no-op refresh
+                # would call setPlainText and silently wipe rich-text
+                # formatting the user just applied.
                 win = self.windows.get(rn.id)
+                visible_changed = (text_changed or title_changed
+                                   or color_changed or list_changed)
                 if win and win.text_edit.hasFocus():
                     log.info("Skipping refresh for %s (user editing)", rn.id[:8])
-                elif win:
+                elif win and visible_changed:
                     log.info("Refreshing window %s", rn.id[:8])
                     self._refresh_window(rn.id)
 
@@ -1199,6 +1220,9 @@ class AppController(QObject):
         if win and note:
             if note.is_list and note.list_items:
                 win._set_checklist_html(note.list_items)
+            elif note.html:
+                # Preserve any local rich-text formatting the user has set.
+                win.set_html(note.html)
             else:
                 win.set_text(note.text)
             win.set_title(note.title)

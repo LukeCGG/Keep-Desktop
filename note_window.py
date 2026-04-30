@@ -206,6 +206,7 @@ class TitleBar(QWidget):
     color_chosen = Signal(str)
     delete_clicked = Signal()
     title_changed = Signal(str)
+    checklist_toggled = Signal()
 
     def __init__(self, title="", color_hex="#FFF475", parent=None):
         super().__init__(parent)
@@ -259,6 +260,13 @@ class TitleBar(QWidget):
         self.color_btn.setFixedSize(28, 28)
         self.color_btn.clicked.connect(self._show_color_picker)
         layout.addWidget(self.color_btn)
+
+        self.checklist_btn = QPushButton("☑")
+        self.checklist_btn.setToolTip("Convert to / from checklist")
+        self.checklist_btn.setStyleSheet(btn_style)
+        self.checklist_btn.setFixedSize(28, 28)
+        self.checklist_btn.clicked.connect(self.checklist_toggled.emit)
+        layout.addWidget(self.checklist_btn)
 
         self.close_btn = QPushButton("✕")
         self.close_btn.setToolTip("Hide note")
@@ -513,6 +521,14 @@ class NoteWindow(QWidget):
         self._show_in_taskbar = show_in_taskbar
         self._is_list = bool(list_items)
 
+        # Explicit per-window icon. QApplication's windowIcon usually
+        # cascades, but on Windows the taskbar reads the per-window icon
+        # directly — setting it here guarantees the K shows up there too.
+        from PySide6.QtWidgets import QApplication
+        app_icon = QApplication.instance().windowIcon() if QApplication.instance() else None
+        if app_icon is not None and not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+
         # Frameless window; Tool flag hides from taskbar
         flags = Qt.WindowType.FramelessWindowHint
         if not show_in_taskbar:
@@ -541,6 +557,7 @@ class NoteWindow(QWidget):
         self.title_bar.pin_toggled.connect(self._on_pin_toggle)
         self.title_bar.color_chosen.connect(self._on_color_change)
         self.title_bar.title_changed.connect(self._on_title_changed)
+        self.title_bar.checklist_toggled.connect(self._toggle_checklist_mode)
         self.title_bar.set_pinned(pinned)
         inner.addWidget(self.title_bar)
 
@@ -652,6 +669,29 @@ class NoteWindow(QWidget):
     def _on_title_changed(self, _text):
         if not self._syncing:
             self.note_changed.emit(self.note_id)
+
+    def _toggle_checklist_mode(self):
+        """Convert the note between plain text and checklist mode."""
+        if self._is_list:
+            # Checklist -> plain text: strip the checkbox prefixes.
+            lines = []
+            for line in self.text_edit.toPlainText().splitlines():
+                stripped = line.lstrip("\u2611\u2610 ").rstrip()
+                lines.append(stripped)
+            self._is_list = False
+            self._syncing = True
+            self.text_edit.setPlainText("\n".join(lines))
+            self._syncing = False
+        else:
+            # Plain text -> checklist: each non-empty line becomes an item.
+            raw = self.text_edit.toPlainText()
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            if not lines:
+                lines = [""]
+            items = [{"text": ln, "checked": False} for ln in lines]
+            self._is_list = True
+            self._set_checklist_html(items)
+        self.note_changed.emit(self.note_id)
 
     @property
     def color_hex(self):

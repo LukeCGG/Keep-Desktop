@@ -3,7 +3,7 @@
 Used by the tray, all windows/dialogs, and (via icon.ico) the Windows EXE.
 """
 
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, QPointF
 from PySide6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QFont, QPainterPath, QPen,
 )
@@ -41,15 +41,17 @@ def _render_pixmap(size: int) -> QPixmap:
     clip.addRoundedRect(rect, radius, radius)
     painter.save()
     painter.setClipPath(clip)
-    spacing = 10 * s                          # ~10px gap on the 64px design
+    # Always draw the same number of evenly-spaced rules regardless of
+    # output size, so the design is visually identical at 16px and 256px.
     inset = 6 * s                             # left/right padding inside the note
-    y = rect.top() + spacing * 1.4
-    while y < rect.bottom() - spacing * 0.4:
+    line_count = 5
+    spacing = rect.height() / (line_count + 1)
+    for i in range(1, line_count + 1):
+        y = rect.top() + spacing * i
         painter.drawLine(
-            QRectF(rect.left() + inset, y, rect.width() - 2 * inset, 0).topLeft(),
-            QRectF(rect.left() + inset, y, rect.width() - 2 * inset, 0).topRight(),
+            QPointF(rect.left() + inset, y),
+            QPointF(rect.right() - inset, y),
         )
-        y += spacing
     painter.restore()
 
     # The "K" — drawn as a vector path so its bounding rect is reliable
