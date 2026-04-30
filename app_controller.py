@@ -1293,8 +1293,9 @@ class AppController(QObject):
             self._full_sync()
             self._sync_timer.start(SYNC_INTERVAL_MS)
             self._update_login_action_text()
-            # Open the manager so the user can pick which notes to show.
-            QTimer.singleShot(500, self._show_note_manager_if_not_open)
+            # Don't auto-open the manager on launch — it's noisy when
+            # KeepDesktop is configured to start with Windows. The user
+            # can open it from the tray any time.
         return ok
 
     def _show_note_manager_if_not_open(self):
@@ -1313,7 +1314,8 @@ class AppController(QObject):
             self._full_sync()
             self._sync_timer.start(SYNC_INTERVAL_MS)
             self._update_login_action_text()
-            QTimer.singleShot(500, self._show_note_manager_if_not_open)
+            # Don't auto-open the manager on first install — the tray
+            # message below tells the user where to find it.
         else:
             if not self.windows:
                 self._new_note()
@@ -1460,14 +1462,10 @@ class AppController(QObject):
         self._save_notes_to_disk()
         self._refresh_manager_if_open()
 
-        # If new remote notes arrived (e.g. created on another device)
-        # and no notes are currently visible, surface the manager so the
-        # user can opt them in. We only auto-open it for *new* notes
-        # that the user hasn't seen before.
-        if new_remote_ids and not self._manager_dialog_open():
-            visible_count = sum(1 for v in self._visibility.values() if v)
-            if visible_count == 0:
-                QTimer.singleShot(0, self._show_note_manager)
+        # We deliberately do NOT auto-open the manager when remote sync
+        # brings in new notes — it would pop up unexpectedly during
+        # background syncs and on every launch. The tray notification
+        # below covers the discoverability case for the first sync.
 
     def _manager_dialog_open(self) -> bool:
         dlg = getattr(self, "_manager_dlg", None)
