@@ -9,16 +9,21 @@ from PySide6.QtWidgets import (
 )
 
 from config import (
-    KEEP_COLORS, DEFAULT_WIDTH, DEFAULT_HEIGHT, MIN_WIDTH, MIN_HEIGHT,
-    set_position, get_position,
+    KEEP_COLORS, KEEP_COLORS_DARK, DEFAULT_WIDTH, DEFAULT_HEIGHT,
+    MIN_WIDTH, MIN_HEIGHT, set_position, get_position,
 )
 
 
 # ── Color Picker Popup ────────────────────────────────────────────────
 
 class ColorPickerPopup(QWidget):
-    """Grid of colored circles on a dark background for picking a note color."""
-    color_chosen = Signal(str)
+    """Grid of colored circles on a dark background for picking a note color.
+
+    Emits ``color_chosen(light_hex, dark_mode)`` so the receiver always
+    knows the canonical Keep (light) colour AND whether the user wanted
+    the dark variant rendered locally.
+    """
+    color_chosen = Signal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
@@ -28,31 +33,44 @@ class ColorPickerPopup(QWidget):
         layout.setSpacing(6)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        colors = list(KEEP_COLORS.items())
-        cols = 4
-        for i, (name, hex_val) in enumerate(colors):
-            btn = QPushButton()
-            btn.setFixedSize(30, 30)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {hex_val};
-                    border: 2px solid rgba(255,255,255,0.3);
-                    border-radius: 15px;
-                }}
-                QPushButton:hover {{
-                    border: 2px solid #ffffff;
-                }}
-            """)
-            # Add space before capitals for tooltip: "DarkBlue" → "Dark Blue"
-            import re
-            display_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
-            btn.setToolTip(display_name)
-            btn.clicked.connect(lambda checked, hv=hex_val: self._on_pick(hv))
-            layout.addWidget(btn, i // cols, i % cols)
+        import re
+        cols = 6
+        # Row 0–1: light variants. Row 2–3: dark variants.
+        items = list(KEEP_COLORS.items())
+        for i, (name, hex_val) in enumerate(items):
+            self._add_swatch(layout, i // cols, i % cols, name, hex_val,
+                             False, KEEP_COLORS[name], re)
+        base_row = (len(items) + cols - 1) // cols
+        for i, (name, _) in enumerate(items):
+            dark_val = KEEP_COLORS_DARK.get(name, "#3C4043")
+            self._add_swatch(layout, base_row + i // cols, i % cols, name,
+                             dark_val, True, KEEP_COLORS[name], re)
 
-    def _on_pick(self, hex_val):
-        self.color_chosen.emit(hex_val)
+    def _add_swatch(self, layout, row, col, name, hex_val, is_dark,
+                    light_hex, re_mod):
+        btn = QPushButton()
+        btn.setFixedSize(28, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        border = "rgba(255,255,255,0.45)" if is_dark else "rgba(255,255,255,0.3)"
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {hex_val};
+                border: 2px solid {border};
+                border-radius: 14px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid #ffffff;
+            }}
+        """)
+        display = re_mod.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+        btn.setToolTip(f"{display}{' (dark)' if is_dark else ''}")
+        btn.clicked.connect(
+            lambda checked, lh=light_hex, dk=is_dark: self._on_pick(lh, dk)
+        )
+        layout.addWidget(btn, row, col)
+
+    def _on_pick(self, light_hex, dark_mode):
+        self.color_chosen.emit(light_hex, dark_mode)
         self.close()
 
 
@@ -85,6 +103,15 @@ class FormattingToolbar(QWidget):
         self.strike_btn = self._make_btn("S", strikeout=True)
         self.strike_btn.clicked.connect(self._toggle_strikethrough)
         layout.addWidget(self.strike_btn)
+
+        self.clear_fmt_btn = self._make_btn("T\u02e3")
+        self.clear_fmt_btn.setCheckable(False)
+        self.clear_fmt_btn.setToolTip(
+            "Clear formatting from the selected text (or the whole note"
+            " if nothing is selected)"
+        )
+        self.clear_fmt_btn.clicked.connect(self._clear_formatting)
+        layout.addWidget(self.clear_fmt_btn)
 
         layout.addStretch()
 
@@ -133,6 +160,16 @@ class FormattingToolbar(QWidget):
         fmt = self._text_edit.currentCharFormat()
         fmt.setFontStrikeOut(not fmt.fontStrikeOut())
         self._text_edit.mergeCurrentCharFormat(fmt)
+
+    def _clear_formatting(self):
+        """Strip rich-text formatting from the selection (or whole note)."""
+        cursor = self._text_edit.textCursor()
+        if not cursor.hasSelection():
+            cursor.select(cursor.SelectionType.Document)
+        plain_fmt = QTextCharFormat()
+        # setCharFormat REPLACES (rather than merges) every property,
+        # so it actually wipes bold/italic/underline/strike/colour/size.
+        cursor.setCharFormat(plain_fmt)
 
     def _update_states(self):
         fmt = self._text_edit.currentCharFormat()
@@ -203,7 +240,7 @@ class TitleBar(QWidget):
 
     close_clicked = Signal()
     pin_toggled = Signal(bool)
-    color_chosen = Signal(str)
+    color_chosen = Signal(str, bool)  # (light_hex, dark_mode)
     delete_clicked = Signal()
     title_changed = Signal(str)
     checklist_toggled = Signal()
@@ -260,13 +297,6 @@ class TitleBar(QWidget):
         self.color_btn.setFixedSize(28, 28)
         self.color_btn.clicked.connect(self._show_color_picker)
         layout.addWidget(self.color_btn)
-
-        self.checklist_btn = QPushButton("☑")
-        self.checklist_btn.setToolTip("Convert to / from checklist")
-        self.checklist_btn.setStyleSheet(btn_style)
-        self.checklist_btn.setFixedSize(28, 28)
-        self.checklist_btn.clicked.connect(self.checklist_toggled.emit)
-        layout.addWidget(self.checklist_btn)
 
         self.close_btn = QPushButton("✕")
         self.close_btn.setToolTip("Hide note")
@@ -396,6 +426,12 @@ class NoteTextEdit(QTextEdit):
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
+        # Ctrl+Shift+V → paste as plain text (matches most modern editors).
+        if (event.key() == Qt.Key.Key_V
+                and (event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            self._paste_plain_text()
+            return
         # Auto-insert checkbox prefix on Enter in list notes
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             cursor = self.textCursor()
@@ -462,6 +498,33 @@ class NoteTextEdit(QTextEdit):
         if win:
             win._set_checklist_html(items)
 
+    def _paste_plain_text(self):
+        """Insert clipboard text without any source formatting."""
+        from PySide6.QtWidgets import QApplication
+        cb = QApplication.clipboard()
+        text = cb.text()
+        if not text:
+            return
+        cursor = self.textCursor()
+        # Use a fresh, empty char format so no styles leak in.
+        cursor.insertText(text, QTextCharFormat())
+
+    def contextMenuEvent(self, event):
+        # Build the standard menu but replace Paste with Paste-as-plain-text.
+        menu = self.createStandardContextMenu()
+        for act in list(menu.actions()):
+            txt = (act.text() or "").lower().replace("&", "")
+            if txt.startswith("paste"):
+                menu.removeAction(act)
+                break
+        from PySide6.QtWidgets import QApplication
+        cb = QApplication.clipboard()
+        has_text = bool(cb.text())
+        paste_act = menu.addAction("Paste as plain text\tCtrl+Shift+V")
+        paste_act.setEnabled(has_text)
+        paste_act.triggered.connect(self._paste_plain_text)
+        menu.exec(event.globalPos())
+
 
 class ResizeGrip(QWidget):
     """Small bottom-right resize handle."""
@@ -513,10 +576,12 @@ class NoteWindow(QWidget):
     note_deleted = Signal(str)   # note_id
 
     def __init__(self, note_id, title="", text="", html="", color_hex="#FFF475",
-                 pinned=False, show_in_taskbar=False, list_items=None, parent=None):
+                 pinned=False, show_in_taskbar=False, list_items=None,
+                 dark_mode=False, parent=None):
         super().__init__(parent)
         self.note_id = note_id
         self._color_hex = color_hex
+        self._dark_mode = dark_mode
         self._syncing = False  # flag to suppress change signals during sync
         self._show_in_taskbar = show_in_taskbar
         self._is_list = bool(list_items)
@@ -625,14 +690,45 @@ class NoteWindow(QWidget):
 
     def _apply_color(self, color_hex):
         self._color_hex = color_hex
+        # When dark mode is on, render with the dark variant + white text;
+        # the wire colour stays light so Keep keeps a clean palette.
+        if self._dark_mode:
+            from config import KEEP_COLORS_DARK, KEEP_COLORS
+            name = next(
+                (k for k, v in KEEP_COLORS.items() if v == color_hex),
+                "Yellow",
+            )
+            bg = KEEP_COLORS_DARK.get(name, color_hex)
+            text_color = "#f1f3f4"
+        else:
+            bg = color_hex
+            text_color = "#333"
         self.container.setStyleSheet(f"""
             QWidget {{
-                background: {color_hex};
+                background: {bg};
                 border-radius: 8px;
             }}
         """)
-        self.title_bar.update_color(color_hex)
-        self.fmt_toolbar.update_color(color_hex)
+        self.text_edit.setStyleSheet(self.text_edit.styleSheet())  # ensure repaint
+        self.text_edit.setStyleSheet(f"""
+            QTextEdit {{
+                border: none;
+                background: transparent;
+                padding: 8px;
+                color: {text_color};
+                selection-background-color: rgba(255,255,255,0.18);
+            }}
+            QScrollBar:vertical {{ width: 6px; background: transparent; }}
+            QScrollBar::handle:vertical {{
+                background: rgba(0,0,0,0.18); border-radius: 3px;
+                min-height: 30px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+        self.title_bar.update_color(bg)
+        self.fmt_toolbar.update_color(bg)
 
     def _on_text_changed(self):
         self._update_char_count()
@@ -662,9 +758,20 @@ class NoteWindow(QWidget):
             self.show()
         self.save_geometry()
 
-    def _on_color_change(self, color_hex):
+    def _on_color_change(self, color_hex, dark_mode=False):
+        self._dark_mode = dark_mode
         self._apply_color(color_hex)
         self.note_changed.emit(self.note_id)
+
+    def set_dark_mode(self, dark_mode: bool):
+        if dark_mode == self._dark_mode:
+            return
+        self._dark_mode = dark_mode
+        self._apply_color(self._color_hex)
+
+    @property
+    def dark_mode(self) -> bool:
+        return self._dark_mode
 
     def _on_title_changed(self, _text):
         if not self._syncing:

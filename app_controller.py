@@ -275,6 +275,8 @@ class NoteManagerDialog(QDialog):
     note_deleted = Signal(str)  # emitted immediately on confirmed delete
     note_create_requested = Signal()  # emitted when user clicks "New note"
     visibility_changed = Signal(str, bool)  # note_id, is_visible (live)
+    checklist_toggle_requested = Signal(str)  # note_id
+    reorder_requested = Signal(str, str)      # note_id, action: top|up|down|bottom
 
     def __init__(self, notes: dict, visibility: dict, parent=None):
         super().__init__(parent)
@@ -389,7 +391,11 @@ class NoteManagerDialog(QDialog):
 
         sorted_notes = sorted(
             visible_notes.values(),
-            key=lambda n: (not n.pinned, n.sort_key),
+            key=lambda n: (
+                not n.pinned,
+                # User-imposed order wins; fall back to Keep's sort_key.
+                n.local_order if n.local_order else n.sort_key,
+            ),
         )
 
         # Track desired order; we'll re-insert each frame in order
@@ -431,6 +437,10 @@ class NoteManagerDialog(QDialog):
             f" border: 1px solid rgba(0,0,0,0.08); }}"
         )
         row.setMinimumHeight(52)
+        row.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        row.customContextMenuRequested.connect(
+            lambda pos, nid=note.id, w=row: self._show_row_menu(nid, w, pos)
+        )
 
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(8, 6, 8, 6)
@@ -571,6 +581,41 @@ class NoteManagerDialog(QDialog):
             self.note_deleted.emit(note_id)
             self._remove_row(note_id)
 
+    def _show_row_menu(self, note_id: str, row_widget, pos):
+        note = self._all_notes.get(note_id)
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #fff; border: 1px solid #ccc;"
+            "        border-radius: 6px; padding: 4px; }"
+            "QMenu::item { padding: 6px 16px; border-radius: 4px; }"
+            "QMenu::item:selected { background: #e0e0e0; }"
+        )
+        if note is not None:
+            label = ("☑  Convert to plain text"
+                     if getattr(note, "is_list", False)
+                     else "☑  Convert to checklist")
+        else:
+            label = "☑  Toggle checklist"
+        act_check = menu.addAction(label)
+        menu.addSeparator()
+        act_top = menu.addAction("⏫  Move to top")
+        act_up = menu.addAction("⬆  Move up")
+        act_down = menu.addAction("⬇  Move down")
+        act_bottom = menu.addAction("⏬  Move to bottom")
+        chosen = menu.exec(row_widget.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_check:
+            self.checklist_toggle_requested.emit(note_id)
+        elif chosen is act_top:
+            self.reorder_requested.emit(note_id, "top")
+        elif chosen is act_up:
+            self.reorder_requested.emit(note_id, "up")
+        elif chosen is act_down:
+            self.reorder_requested.emit(note_id, "down")
+        elif chosen is act_bottom:
+            self.reorder_requested.emit(note_id, "bottom")
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  App Controller
@@ -684,10 +729,6 @@ class AppController(QObject):
 
         menu.addSeparator()
 
-        check_updates_action = QAction("⬆  Check for updates…", menu)
-        check_updates_action.triggered.connect(self._manual_update_check)
-        menu.addAction(check_updates_action)
-
         about_action = QAction("ℹ  About KeepDesktop", menu)
         about_action.triggered.connect(self._show_about)
         menu.addAction(about_action)
@@ -729,6 +770,8 @@ class AppController(QObject):
                 "sort_key": note.sort_key,
                 "is_list": note.is_list,
                 "list_items": note.list_items,
+                "local_order": note.local_order,
+                "dark_mode": note.dark_mode,
             }
         save_json(NOTES_FILE, data)
 
@@ -746,6 +789,8 @@ class AppController(QObject):
                 sort_key=d.get("sort_key", 0),
                 is_list=d.get("is_list", False),
                 list_items=d.get("list_items", []),
+                local_order=d.get("local_order", 0),
+                dark_mode=d.get("dark_mode", False),
             )
             self._notes[nid] = note
             if nid not in self._visibility:
@@ -770,6 +815,7 @@ class AppController(QObject):
             pinned=False,
             show_in_taskbar=self._show_in_taskbar,
             list_items=note.list_items if note.is_list else None,
+            dark_mode=note.dark_mode,
         )
         win.note_changed.connect(self._on_note_changed)
         win.note_hidden.connect(self._on_note_hidden)
@@ -820,6 +866,7 @@ class AppController(QObject):
             note.text = win.get_text()
             note.title = win.get_title()
             note.color_hex = win.color_hex
+            note.dark_mode = bool(getattr(win, "dark_mode", False))
             note.html = win.get_html()
             # The window may have been toggled in/out of checklist mode
             # by the user; pick that up so it persists.
@@ -868,6 +915,79 @@ class AppController(QObject):
                 win.raise_()
                 win.activateWindow()
 
+    @Slot(str)
+    def _toggle_note_checklist(self, note_id: str):
+        """Convert the note between plain text and checklist mode."""
+        note = self._notes.get(note_id)
+        if note is None:
+            return
+        win = self.windows.get(note_id)
+        if note.is_list:
+            # Checklist -> plain text. Strip the prefixes.
+            lines = []
+            for item in note.list_items or []:
+                lines.append(item.get("text", ""))
+            note.is_list = False
+            note.list_items = []
+            note.text = "\n".join(lines)
+            note.html = ""  # rich-text from checklist render is no longer valid
+        else:
+            # Plain text -> checklist.
+            raw = note.text or ""
+            items = [
+                {"text": ln.strip(), "checked": False}
+                for ln in raw.splitlines() if ln.strip()
+            ]
+            if not items:
+                items = [{"text": "", "checked": False}]
+            note.is_list = True
+            note.list_items = items
+            note.html = ""
+        self._dirty.add(note_id)
+        if win is not None:
+            self._refresh_window(note_id)
+        self._save_notes_to_disk()
+        self._refresh_manager_if_open()
+        if self.sync.is_authenticated:
+            threading.Thread(
+                target=self.sync.push_note, args=(note,), daemon=True
+            ).start()
+
+    @Slot(str, str)
+    def _reorder_note(self, note_id: str, action: str):
+        """Move ``note_id`` within the user-imposed order."""
+        note = self._notes.get(note_id)
+        if note is None:
+            return
+        # Build the current ordered list (mirrors NoteManagerDialog sort).
+        ordered = sorted(
+            self._notes.values(),
+            key=lambda n: (
+                not n.pinned,
+                n.local_order if n.local_order else n.sort_key,
+            ),
+        )
+        try:
+            idx = ordered.index(note)
+        except ValueError:
+            return
+        if action == "top":
+            ordered.insert(0, ordered.pop(idx))
+        elif action == "bottom":
+            ordered.append(ordered.pop(idx))
+        elif action == "up" and idx > 0:
+            ordered[idx - 1], ordered[idx] = ordered[idx], ordered[idx - 1]
+        elif action == "down" and idx < len(ordered) - 1:
+            ordered[idx + 1], ordered[idx] = ordered[idx], ordered[idx + 1]
+        else:
+            return
+        # Rewrite local_order densely so the new arrangement sticks.
+        # Spacing of 10 leaves room for incremental tweaks later.
+        for i, n in enumerate(ordered):
+            n.local_order = (i + 1) * 10
+        self._save_notes_to_disk()
+        self._refresh_manager_if_open()
+
     # ── Note Manager ───────────────────────────────────────────────────
 
     def _show_note_manager(self):
@@ -883,6 +1003,8 @@ class AppController(QObject):
         dlg.note_deleted.connect(self._on_note_deleted)
         dlg.note_create_requested.connect(self._new_note)
         dlg.visibility_changed.connect(self._on_manager_visibility_changed)
+        dlg.checklist_toggle_requested.connect(self._toggle_note_checklist)
+        dlg.reorder_requested.connect(self._reorder_note)
         dlg.accepted.connect(lambda: self._on_manager_accepted(dlg))
         dlg.rejected.connect(lambda: self._on_manager_closed())
         dlg.finished.connect(lambda _r: self._on_manager_closed())
@@ -1142,6 +1264,10 @@ class AppController(QObject):
                 existing.title = rn.title
                 if text_changed:
                     existing.html = ""  # text changed remotely — stale html
+                if color_changed:
+                    # User changed colour on the web → drop our local
+                    # dark-mode override so we follow the new colour.
+                    existing.dark_mode = False
                 existing.color_hex = rn.color_hex
                 existing.list_items = rn.list_items
                 existing.is_list = rn.is_list
@@ -1218,6 +1344,8 @@ class AppController(QObject):
         win = self.windows.get(note_id)
         note = self._notes.get(note_id)
         if win and note:
+            win._is_list = note.is_list
+            win.set_dark_mode(note.dark_mode)
             if note.is_list and note.list_items:
                 win._set_checklist_html(note.list_items)
             elif note.html:
@@ -1297,10 +1425,30 @@ class AppController(QObject):
             f"Couldn't check for updates:\n{msg}"
         )
 
+    def _open_log_file(self):
+        log_path = os.path.join(DATA_DIR, "keepdesktop.log")
+        if not os.path.exists(log_path):
+            QMessageBox.information(
+                None, APP_NAME,
+                f"No log file yet at:\n{log_path}",
+            )
+            return
+        try:
+            os.startfile(log_path)  # Windows: opens in default text editor
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                None, APP_NAME,
+                f"Couldn't open log file:\n{exc}\n\nIt's at:\n{log_path}",
+            )
+
     def _show_about(self):
-        QMessageBox.about(
-            None,
-            f"About {APP_NAME}",
+        dlg = QDialog()
+        dlg.setWindowTitle(f"About {APP_NAME}")
+        dlg.setMinimumWidth(420)
+        v = QVBoxLayout(dlg)
+        v.setSpacing(10)
+
+        body = QLabel(
             f"<h3>{APP_NAME} {APP_VERSION}</h3>"
             "<p>Google Keep on your Windows desktop as floating sticky notes.</p>"
             "<p>Licensed under the "
@@ -1309,6 +1457,27 @@ class AppController(QObject):
             f"<p><a href='https://github.com/{GITHUB_REPO}'>"
             f"github.com/{GITHUB_REPO}</a></p>"
         )
+        body.setOpenExternalLinks(True)
+        body.setWordWrap(True)
+        v.addWidget(body)
+
+        btn_row = QHBoxLayout()
+        check_btn = QPushButton("⬆  Check for updates…")
+        check_btn.clicked.connect(lambda: (dlg.accept(), self._manual_update_check()))
+        btn_row.addWidget(check_btn)
+
+        log_btn = QPushButton("📄  Open log file")
+        log_btn.clicked.connect(self._open_log_file)
+        btn_row.addWidget(log_btn)
+
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+
+        dlg.exec()
 
     def _quit(self):
         # Save all window geometry
@@ -1321,6 +1490,7 @@ class AppController(QObject):
                 note.text = win.get_text()
                 note.title = win.get_title()
                 note.color_hex = win.color_hex
+                note.dark_mode = bool(getattr(win, "dark_mode", False))
                 note.html = win.get_html()
         self._save_notes_to_disk()
         # Push dirty notes if authenticated

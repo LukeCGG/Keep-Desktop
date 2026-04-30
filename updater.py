@@ -117,10 +117,12 @@ def download_installer(url: str, progress_cb=None) -> str | None:
     fd, dest = tempfile.mkstemp(prefix="KeepDesktopUpdate-", suffix="-" + suffix)
     os.close(fd)
 
+    log.info("Downloading update from %s -> %s", url, dest)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             total = int(resp.headers.get("Content-Length", "0") or 0)
+            log.info("Download started; Content-Length=%s", total)
             downloaded = 0
             with open(dest, "wb") as out:
                 while True:
@@ -134,9 +136,13 @@ def download_installer(url: str, progress_cb=None) -> str | None:
                             progress_cb(downloaded, total)
                         except Exception:  # noqa: BLE001
                             pass
+        size = os.path.getsize(dest)
+        log.info("Download finished: %s bytes -> %s", size, dest)
+        if size < 100_000:  # sanity check; real installer is several MB
+            log.error("Downloaded file is suspiciously small (%s bytes)", size)
         return dest
     except Exception as exc:  # noqa: BLE001
-        log.error("Failed to download installer: %s", exc)
+        log.exception("Failed to download installer: %s", exc)
         try:
             os.remove(dest)
         except OSError:
@@ -278,7 +284,6 @@ def prompt_and_install(parent, info: ReleaseInfo):
         msg.setInformativeText(
             "<b>Release notes</b><br><br>" + _notes_to_html(short_notes)
         )
-    # Allow links in the dialog to be clicked / opened in browser.
     msg.setTextInteractionFlags(
         Qt.TextInteractionFlag.TextBrowserInteraction
     )
@@ -292,32 +297,144 @@ def prompt_and_install(parent, info: ReleaseInfo):
     if msg.exec() != QMessageBox.StandardButton.Yes:
         return
 
-    # Show a non-blocking "downloading" dialog while we fetch.
+    _start_download_install(parent, info)
+
+
+# Keep a strong reference to the in-flight worker so it isn't GC'd.
+_active_worker = None
+
+
+class _DownloadWorker(QObject):
+    """Runs the download on a worker thread and signals the main thread."""
+
+    finished = Signal(str, str)  # (path_or_empty, error_message)
+
+    def __init__(self, url: str):
+        super().__init__()
+        self._url = url
+
+    def run(self):
+        try:
+            path = download_installer(self._url)
+            if path:
+                self.finished.emit(path, "")
+            else:
+                self.finished.emit("", "Download failed (see log file).")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Download worker crashed")
+            self.finished.emit("", f"Download crashed: {exc}")
+
+
+def _data_dir() -> str:
+    try:
+        from config import DATA_DIR
+        return DATA_DIR
+    except Exception:  # noqa: BLE001
+        return tempfile.gettempdir()
+
+
+def _release_url() -> str:
+    try:
+        from config import GITHUB_REPO
+        return f"https://github.com/{GITHUB_REPO}/releases/latest"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _start_download_install(parent, info: ReleaseInfo):
+    """Show a progress dialog, download in a worker, install when done."""
+    global _active_worker
+
+    log_path = os.path.join(_data_dir(), "keepdesktop.log")
+    log.info("Starting update: %s -> %s", APP_VERSION, info.version)
+    log.info("Installer URL: %s", info.download_url)
+
     busy = QMessageBox(parent)
     busy.setIcon(QMessageBox.Icon.Information)
-    busy.setWindowTitle(f"{APP_NAME}")
-    busy.setText("Downloading update…\nThis may take a moment.")
+    busy.setWindowTitle(APP_NAME)
+    busy.setText(
+        f"Downloading {APP_NAME} {info.version}…\n"
+        "This may take a moment."
+    )
     busy.setStandardButtons(QMessageBox.StandardButton.NoButton)
+    # Non-modal so the OS can paint it AND so the worker thread's
+    # cross-thread signal can be delivered to our main event loop.
+    busy.setModal(False)
     busy.show()
     QApplication.processEvents()
 
-    def _download():
-        path = download_installer(info.download_url)
-        QTimer.singleShot(0, lambda: _after_download(path))
+    worker = _DownloadWorker(info.download_url)
+    _active_worker = worker
 
-    def _after_download(path):
+    def _on_finished(path: str, err: str):
+        global _active_worker
+        log.info("Download worker finished: path=%r err=%r", path, err)
         busy.close()
-        if not path:
-            QMessageBox.warning(
-                parent, APP_NAME,
-                "Update download failed. Please try again later."
-            )
-            return
-        if not run_installer_and_quit(path):
-            QMessageBox.warning(
-                parent, APP_NAME,
-                "Couldn't launch the installer. The downloaded file is here:\n"
-                + path
-            )
 
-    threading.Thread(target=_download, daemon=True).start()
+        if not path:
+            _show_update_failed(parent, info, log_path,
+                                err or "Update download failed.")
+            _active_worker = None
+            return
+
+        ok, launch_err = _launch_installer(path)
+        if not ok:
+            _show_update_failed(
+                parent, info, log_path,
+                f"Couldn't launch the installer.\n{launch_err}\n\n"
+                f"You can run it manually:\n{path}",
+            )
+            _active_worker = None
+            return
+
+        log.info("Installer launched; quitting in 2.5s to let it take over")
+        QTimer.singleShot(2500, QApplication.instance().quit)
+        _active_worker = None
+
+    # Queued connection guarantees _on_finished runs on the main (GUI)
+    # thread regardless of which thread emits the signal.
+    worker.finished.connect(_on_finished, Qt.ConnectionType.QueuedConnection)
+
+    threading.Thread(target=worker.run, daemon=True).start()
+
+
+def _launch_installer(installer_path: str) -> tuple[bool, str]:
+    """Try to start the installer. Returns (ok, error_message)."""
+    if not os.path.isfile(installer_path):
+        return False, f"Installer file not found: {installer_path}"
+    try:
+        ok = run_installer_and_quit(installer_path)
+        if ok:
+            return True, ""
+        return False, "ShellExecuteW returned a failure code (see log file)."
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Launch installer crashed")
+        return False, str(exc)
+
+
+def _show_update_failed(parent, info: ReleaseInfo, log_path: str, detail: str):
+    """Show a clear error dialog with the log path and a fallback link."""
+    log.error("Update failed: %s", detail)
+
+    release_url = _release_url()
+    body = (
+        f"<b>Update to {APP_NAME} {info.version} failed.</b>"
+        f"<br><br>{_notes_to_html(detail)}"
+    )
+    if release_url:
+        body += (
+            f"<br><br>You can download and install it manually from "
+            f'<a href="{release_url}">{release_url}</a>.'
+        )
+    body += (
+        f"<br><br><small>Log file:<br><code>{log_path}</code></small>"
+    )
+
+    err = QMessageBox(parent)
+    err.setIcon(QMessageBox.Icon.Warning)
+    err.setWindowTitle(f"{APP_NAME} update failed")
+    err.setTextFormat(Qt.TextFormat.RichText)
+    err.setText(body)
+    err.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+    err.setStandardButtons(QMessageBox.StandardButton.Ok)
+    err.exec()

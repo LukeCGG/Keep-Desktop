@@ -32,6 +32,15 @@ class KeepNote:
     sort_key: int = 0
     is_list: bool = False
     list_items: list = field(default_factory=list)  # [{text, checked}]
+    # User-imposed order in the manager / desktop. 0 = unset, fall back
+    # to ``sort_key`` from Keep. When the user reorders notes locally we
+    # set this to a sequential value so it persists across syncs.
+    local_order: int = 0
+    # Whether the user picked a dark variant from our extended palette.
+    # Wire-color (color_hex) is always the matching LIGHT colour Keep
+    # knows about; dark_mode is local-only and is reset to False whenever
+    # the colour changes server-side.
+    dark_mode: bool = False
 
 
 def _color_to_hex(keep_color) -> str:

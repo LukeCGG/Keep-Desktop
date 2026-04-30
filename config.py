@@ -6,7 +6,7 @@ import sys
 import winreg
 
 APP_NAME = "KeepDesktop"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 # GitHub repository (owner/name) used for the auto-updater.
 GITHUB_REPO = "LukeCGG/Keep-Desktop"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +30,25 @@ KEEP_COLORS = {
     "Pink": "#FDCFE8",
     "Brown": "#E6C9A8",
     "Gray": "#E8EAED",
+}
+
+# Dark variants for the same Keep colour names. These are LOCAL-ONLY: the
+# value sent back to Google Keep is always the matching LIGHT colour from
+# KEEP_COLORS above. Picking a dark variant flips ``KeepNote.dark_mode``
+# but leaves ``color_hex`` pointing at the light value Keep understands.
+KEEP_COLORS_DARK = {
+    "White":    "#3C4043",
+    "Red":      "#5C2B29",
+    "Orange":   "#614A19",
+    "Yellow":   "#635D19",
+    "Green":    "#345920",
+    "Teal":     "#16504B",
+    "Blue":     "#2D555E",
+    "DarkBlue": "#1E3A5F",
+    "Purple":   "#42275E",
+    "Pink":     "#5B2245",
+    "Brown":    "#442F19",
+    "Gray":     "#3C3F43",
 }
 
 # Default window dimensions
