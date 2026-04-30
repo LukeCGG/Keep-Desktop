@@ -14,6 +14,40 @@ from config import (
 )
 
 
+# Shared light-mode menu style. Forces dark-on-white so Windows' OS-level
+# dark mode probe doesn't render menus white-on-white inside our app.
+_LIGHT_MENU_QSS = (
+    "QMenu { background: #ffffff; color: #222; border: 1px solid #ccc;"
+    "        border-radius: 6px; padding: 4px; }"
+    "QMenu::item { padding: 6px 16px; border-radius: 4px; color: #222; }"
+    "QMenu::item:selected { background: #e0e0e0; color: #000; }"
+    "QMenu::item:disabled { color: #aaa; }"
+    "QMenu::separator { height: 1px; background: #ddd; margin: 4px 6px; }"
+)
+
+
+def _start_native_drag(window) -> bool:
+    """Hand the drag off to Windows so the user gets Aero Snap behaviour
+    (drag-to-edge to half-tile, drag-to-top to maximize, etc.) on our
+    frameless windows. Returns True on success."""
+    import sys
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        hwnd = int(window.winId())
+        # Release any current capture, then ask the non-client area to
+        # treat the press as a caption click — that's what triggers the
+        # OS window-management gestures.
+        WM_NCLBUTTONDOWN = 0x00A1
+        HTCAPTION = 2
+        ctypes.windll.user32.ReleaseCapture()
+        ctypes.windll.user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ── Color Picker Popup ────────────────────────────────────────────────
 
 class ColorPickerPopup(QWidget):
@@ -82,6 +116,7 @@ class FormattingToolbar(QWidget):
     def __init__(self, text_edit, color_hex="#FFF475", parent=None):
         super().__init__(parent)
         self._text_edit = text_edit
+        self._dark = False
         self.setFixedHeight(28)
 
         layout = QHBoxLayout(self)
@@ -181,6 +216,28 @@ class FormattingToolbar(QWidget):
     def update_color(self, color_hex):
         darker = QColor(color_hex).darker(105).name()
         self.setStyleSheet(f"FormattingToolbar {{ background: {darker}; }}")
+        self._restyle_buttons()
+
+    def set_dark(self, dark: bool):
+        self._dark = dark
+        self._restyle_buttons()
+
+    def _restyle_buttons(self):
+        if self._dark:
+            color, hover, checked = "#e8eaed", "rgba(255,255,255,0.12)", "rgba(255,255,255,0.22)"
+        else:
+            color, hover, checked = "#555", "rgba(0,0,0,0.08)", "rgba(0,0,0,0.14)"
+        qss = (
+            "QPushButton {"
+            f"  border: none; border-radius: 3px; color: {color};"
+            "  background: transparent;"
+            "}"
+            f"QPushButton:hover {{ background: {hover}; }}"
+            f"QPushButton:checked {{ background: {checked}; }}"
+        )
+        for b in (self.bold_btn, self.italic_btn, self.underline_btn,
+                  self.strike_btn, self.clear_fmt_btn):
+            b.setStyleSheet(qss)
 
 
 # ── Title Bar ──────────────────────────────────────────────────────────
@@ -198,11 +255,17 @@ class DragHandle(QWidget):
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setToolTip("Drag to move note")
         self._drag_pos = None
+        self._dark = False
+
+    def set_dark(self, dark: bool):
+        self._dark = dark
+        self.update()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor(0, 0, 0, 110))
+        pen = QPen(QColor(255, 255, 255, 160) if self._dark
+                   else QColor(0, 0, 0, 110))
         pen.setWidth(2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
@@ -220,7 +283,14 @@ class DragHandle(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.window().pos()
+            win = self.window()
+            if _start_native_drag(win):
+                # OS now owns the drag; we'll save geometry on release
+                # via a moveEvent hook in the parent window.
+                self._drag_pos = None
+                event.accept()
+                return
+            self._drag_pos = event.globalPosition().toPoint() - win.pos()
             event.accept()
 
     def mouseMoveEvent(self, event):
@@ -251,6 +321,7 @@ class TitleBar(QWidget):
         self._drag_pos = None
         self._pinned = False
         self._color_hex = color_hex
+        self._dark = False
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 0, 4, 0)
@@ -317,6 +388,39 @@ class TitleBar(QWidget):
                 border-top-right-radius: 8px;
             }}
         """)
+        self._restyle_widgets()
+
+    def set_dark(self, dark: bool):
+        self._dark = dark
+        self._restyle_widgets()
+        self.drag_handle.set_dark(dark)
+
+    def _restyle_widgets(self):
+        if self._dark:
+            text_color, hover, focus_bg, btn_color = (
+                "#f1f3f4", "rgba(255,255,255,0.12)",
+                "rgba(255,255,255,0.18)", "#dadce0",
+            )
+        else:
+            text_color, hover, focus_bg, btn_color = (
+                "#222", "rgba(0,0,0,0.10)",
+                "rgba(255,255,255,0.4)", "#666",
+            )
+        self.title_edit.setStyleSheet(
+            f"QLineEdit {{ color: {text_color}; background: transparent;"
+            f"             border: none; padding: 0px; font-weight: bold; }}"
+            f"QLineEdit:focus {{ background: {focus_bg};"
+            f"                   border-radius: 3px; color: {text_color}; }}"
+        )
+        btn_qss = (
+            "QPushButton {"
+            f"  border: none; border-radius: 3px; font-size: 14px;"
+            f"  color: {btn_color}; padding: 2px 6px; background: transparent;"
+            "}"
+            f"QPushButton:hover {{ background: {hover}; }}"
+        )
+        for b in (self.pin_btn, self.color_btn, self.close_btn):
+            b.setStyleSheet(btn_qss)
 
     def _toggle_pin(self):
         self._pinned = not self._pinned
@@ -324,10 +428,29 @@ class TitleBar(QWidget):
         self.pin_toggled.emit(self._pinned)
 
     def _show_color_picker(self):
+        from PySide6.QtWidgets import QApplication
         self._color_popup = ColorPickerPopup(self)
         self._color_popup.color_chosen.connect(self.color_chosen.emit)
-        pos = self.color_btn.mapToGlobal(QPoint(0, self.color_btn.height()))
-        self._color_popup.move(pos)
+        # Pre-show to settle size, then position so it stays inside the
+        # current screen instead of falling off-edge near the right side.
+        self._color_popup.adjustSize()
+        size = self._color_popup.size()
+        anchor = self.color_btn.mapToGlobal(QPoint(0, self.color_btn.height()))
+        screen = QApplication.screenAt(anchor) or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+
+        x, y = anchor.x(), anchor.y()
+        # Right-align under the button if it would overflow on the right.
+        if x + size.width() > avail.right():
+            x = self.color_btn.mapToGlobal(
+                QPoint(self.color_btn.width(), 0)
+            ).x() - size.width()
+        x = max(avail.left() + 4, min(x, avail.right() - size.width() - 4))
+        # Flip above the button if it would overflow at the bottom.
+        if y + size.height() > avail.bottom():
+            y = self.color_btn.mapToGlobal(QPoint(0, 0)).y() - size.height()
+        y = max(avail.top() + 4, min(y, avail.bottom() - size.height() - 4))
+        self._color_popup.move(x, y)
         self._color_popup.show()
 
     def set_pinned(self, pinned):
@@ -336,7 +459,12 @@ class TitleBar(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.window().pos()
+            win = self.window()
+            if _start_native_drag(win):
+                self._drag_pos = None
+                event.accept()
+                return
+            self._drag_pos = event.globalPosition().toPoint() - win.pos()
 
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
@@ -509,9 +637,20 @@ class NoteTextEdit(QTextEdit):
         # Use a fresh, empty char format so no styles leak in.
         cursor.insertText(text, QTextCharFormat())
 
+    def insertFromMimeData(self, source):
+        """Default Ctrl+V → plain text. The user can still apply formatting
+        with the toolbar after pasting; this matches what most note-takers
+        expect (and avoids dragging in colours/fonts from web pages)."""
+        if source.hasText():
+            cursor = self.textCursor()
+            cursor.insertText(source.text(), QTextCharFormat())
+        else:
+            super().insertFromMimeData(source)
+
     def contextMenuEvent(self, event):
-        # Build the standard menu but replace Paste with Paste-as-plain-text.
+        # Build the standard menu but replace Paste with Paste (plain text).
         menu = self.createStandardContextMenu()
+        menu.setStyleSheet(_LIGHT_MENU_QSS)
         for act in list(menu.actions()):
             txt = (act.text() or "").lower().replace("&", "")
             if txt.startswith("paste"):
@@ -520,7 +659,7 @@ class NoteTextEdit(QTextEdit):
         from PySide6.QtWidgets import QApplication
         cb = QApplication.clipboard()
         has_text = bool(cb.text())
-        paste_act = menu.addAction("Paste as plain text\tCtrl+Shift+V")
+        paste_act = menu.addAction("Paste\tCtrl+V")
         paste_act.setEnabled(has_text)
         paste_act.triggered.connect(self._paste_plain_text)
         menu.exec(event.globalPos())
@@ -589,10 +728,16 @@ class NoteWindow(QWidget):
         # Explicit per-window icon. QApplication's windowIcon usually
         # cascades, but on Windows the taskbar reads the per-window icon
         # directly — setting it here guarantees the K shows up there too.
-        from PySide6.QtWidgets import QApplication
-        app_icon = QApplication.instance().windowIcon() if QApplication.instance() else None
-        if app_icon is not None and not app_icon.isNull():
-            self.setWindowIcon(app_icon)
+        # We also tint the icon to match the note colour so each pinned
+        # note in the taskbar is visually distinct.
+        try:
+            from app_icon import make_icon as _make_icon
+            self.setWindowIcon(_make_icon(color_hex))
+        except Exception:  # noqa: BLE001
+            from PySide6.QtWidgets import QApplication
+            inst = QApplication.instance()
+            if inst is not None and not inst.windowIcon().isNull():
+                self.setWindowIcon(inst.windowIcon())
 
         # Frameless window; Tool flag hides from taskbar
         flags = Qt.WindowType.FramelessWindowHint
@@ -729,6 +874,21 @@ class NoteWindow(QWidget):
         """)
         self.title_bar.update_color(bg)
         self.fmt_toolbar.update_color(bg)
+        # Propagate dark mode so titlebar, drag handle, and toolbar
+        # buttons all use light text/icons against the dark background.
+        self.title_bar.set_dark(self._dark_mode)
+        self.fmt_toolbar.set_dark(self._dark_mode)
+        cc_color = ("rgba(255,255,255,0.45)" if self._dark_mode
+                    else "rgba(0,0,0,0.3)")
+        self.char_count.setStyleSheet(
+            f"color: {cc_color}; font-size: 9px; background: transparent;"
+        )
+        # Recolour the per-window taskbar icon to match the note.
+        try:
+            from app_icon import make_icon as _make_icon
+            self.setWindowIcon(_make_icon(bg))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_text_changed(self):
         self._update_char_count()
@@ -878,9 +1038,25 @@ class NoteWindow(QWidget):
 
     def moveEvent(self, event):
         super().moveEvent(event)
+        # Aero-snap and other OS-driven moves never trigger our mouse
+        # release handler. Persist geometry as the window settles so a
+        # snap-then-quit doesn't lose the user's arrangement.
+        self._schedule_geometry_save()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._schedule_geometry_save()
+
+    def _schedule_geometry_save(self):
+        # Debounce: many move/resize events fire per drag, but we only
+        # need to write the final geometry to disk.
+        from PySide6.QtCore import QTimer
+        if not hasattr(self, "_geo_save_timer"):
+            self._geo_save_timer = QTimer(self)
+            self._geo_save_timer.setSingleShot(True)
+            self._geo_save_timer.setInterval(400)
+            self._geo_save_timer.timeout.connect(self.save_geometry)
+        self._geo_save_timer.start()
 
     def set_taskbar_visible(self, show):
         """Toggle whether this note appears in the Windows taskbar."""
@@ -903,11 +1079,7 @@ class NoteWindow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background: #fff; border: 1px solid #ccc; border-radius: 6px; padding: 4px; }
-            QMenu::item { padding: 6px 16px; border-radius: 4px; }
-            QMenu::item:selected { background: #e0e0e0; }
-        """)
+        menu.setStyleSheet(_LIGHT_MENU_QSS)
         delete_action = menu.addAction("🗑  Delete note")
         chosen = menu.exec(event.globalPos())
         if chosen == delete_action:

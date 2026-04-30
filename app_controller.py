@@ -31,6 +31,98 @@ log = logging.getLogger(__name__)
 VISIBILITY_FILE = os.path.join(DATA_DIR, "visibility.json")
 
 
+def _set_window_app_id(window, app_id: str) -> None:
+    """Set per-window AppUserModelID via IPropertyStore so Windows can
+    group (or refuse to group) this HWND in the taskbar.
+
+    No-op on non-Windows. Failures are non-fatal and logged by the caller.
+    """
+    import sys
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+    hwnd = int(window.winId())
+
+    # SHGetPropertyStoreForWindow + IPropertyStore::SetValue(PKEY_AppUserModel_ID).
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32),
+                    ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", GUID), ("pid", ctypes.c_uint32)]
+
+    class PROPVARIANT(ctypes.Structure):
+        _fields_ = [
+            ("vt", ctypes.c_ushort),
+            ("wReserved1", ctypes.c_ushort),
+            ("wReserved2", ctypes.c_ushort),
+            ("wReserved3", ctypes.c_ushort),
+            ("pwszVal", ctypes.c_wchar_p),
+            ("padding", ctypes.c_uint64),
+        ]
+
+    # IPropertyStore IID and PKEY_AppUserModel_ID.
+    IID_IPropertyStore = GUID(
+        0x886D8EEB, 0x8CF2, 0x4446,
+        (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99),
+    )
+    PKEY_AppUserModel_ID = PROPERTYKEY(
+        GUID(0x9F4C2855, 0x9F79, 0x4B39,
+             (ctypes.c_ubyte * 8)(0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3)),
+        5,
+    )
+
+    shell32 = ctypes.windll.shell32
+    ole32 = ctypes.windll.ole32
+
+    # InitPropVariantFromString equivalent.
+    PropVariantInit = ole32.PropVariantInit
+    PropVariantInit.argtypes = [ctypes.POINTER(PROPVARIANT)]
+    PropVariantClear = ole32.PropVariantClear
+    PropVariantClear.argtypes = [ctypes.POINTER(PROPVARIANT)]
+
+    SHGetPropertyStoreForWindow = shell32.SHGetPropertyStoreForWindow
+    SHGetPropertyStoreForWindow.argtypes = [
+        wintypes.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+    ]
+    SHGetPropertyStoreForWindow.restype = ctypes.c_long
+
+    pStore = ctypes.c_void_p()
+    hr = SHGetPropertyStoreForWindow(
+        hwnd, ctypes.byref(IID_IPropertyStore), ctypes.byref(pStore)
+    )
+    if hr != 0 or not pStore.value:
+        raise OSError(f"SHGetPropertyStoreForWindow hr=0x{hr & 0xFFFFFFFF:08X}")
+
+    # IPropertyStore vtable: [QueryInterface, AddRef, Release, GetCount,
+    #                         GetAt, GetValue, SetValue, Commit]
+    vtbl = ctypes.cast(pStore, ctypes.POINTER(ctypes.c_void_p))[0]
+    SetValue = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_void_p,
+        ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT),
+    )(ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[6])
+    Commit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(
+        ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[7]
+    )
+    Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(
+        ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[2]
+    )
+
+    pv = PROPVARIANT()
+    PropVariantInit(ctypes.byref(pv))
+    pv.vt = 31  # VT_LPWSTR
+    pv.pwszVal = ctypes.c_wchar_p(app_id)
+    try:
+        SetValue(pStore, ctypes.byref(PKEY_AppUserModel_ID), ctypes.byref(pv))
+        Commit(pStore)
+    finally:
+        PropVariantClear(ctypes.byref(pv))
+        Release(pStore)
+
+
 def _load_visibility() -> dict:
     return load_json(VISIBILITY_FILE, {})
 
@@ -585,10 +677,12 @@ class NoteManagerDialog(QDialog):
         note = self._all_notes.get(note_id)
         menu = QMenu(self)
         menu.setStyleSheet(
-            "QMenu { background: #fff; border: 1px solid #ccc;"
+            "QMenu { background: #ffffff; color: #222; border: 1px solid #ccc;"
             "        border-radius: 6px; padding: 4px; }"
-            "QMenu::item { padding: 6px 16px; border-radius: 4px; }"
-            "QMenu::item:selected { background: #e0e0e0; }"
+            "QMenu::item { padding: 6px 16px; border-radius: 4px;"
+            "              color: #222; }"
+            "QMenu::item:selected { background: #e0e0e0; color: #000; }"
+            "QMenu::separator { height: 1px; background: #ddd; margin: 4px 6px; }"
         )
         if note is not None:
             label = ("☑  Convert to plain text"
@@ -721,6 +815,16 @@ class AppController(QObject):
         self._taskbar_action.toggled.connect(self._toggle_taskbar)
         menu.addAction(self._taskbar_action)
 
+        # Sub-option: only meaningful when notes are in the taskbar.
+        # Default ON (group all notes together under one icon). Turning
+        # it off gives each note its own taskbar entry.
+        self._group_action = QAction("    \u2937 Group notes in taskbar", menu)
+        self._group_action.setCheckable(True)
+        self._group_action.setChecked(self.config.get("group_in_taskbar", True))
+        self._group_action.setEnabled(self._show_in_taskbar)
+        self._group_action.toggled.connect(self._toggle_taskbar_grouping)
+        menu.addAction(self._group_action)
+
         autostart_action = QAction("Start with Windows", menu)
         autostart_action.setCheckable(True)
         autostart_action.setChecked(self.config.get("autostart", False))
@@ -802,6 +906,8 @@ class AppController(QObject):
                 win = self._create_window(note)
                 self.windows[note_id] = win
                 win.show()
+        # Group/ungroup once all initial windows have HWNDs.
+        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     # ── Note management ────────────────────────────────────────────────
 
@@ -835,6 +941,7 @@ class AppController(QObject):
 
         if self.sync.is_authenticated:
             threading.Thread(target=self._push_new_note, args=(note,), daemon=True).start()
+        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     def _push_new_note(self, note: KeepNote):
         result = self.sync.create_note(note.title, note.text, note.color_hex)
@@ -1066,6 +1173,37 @@ class AppController(QObject):
         save_config(self.config)
         for win in self.windows.values():
             win.set_taskbar_visible(show)
+        # Apply grouping immediately for the new visibility state.
+        self._apply_taskbar_grouping()
+        # Group toggle is only meaningful when notes are in the taskbar.
+        if hasattr(self, "_group_action"):
+            self._group_action.setEnabled(show)
+
+    def _toggle_taskbar_grouping(self, group: bool):
+        self.config["group_in_taskbar"] = group
+        save_config(self.config)
+        self._apply_taskbar_grouping()
+
+    def _apply_taskbar_grouping(self):
+        """Set per-window AppUserModelID so Windows groups (or doesn't)
+        the notes in the taskbar.
+
+        When grouping is ON: every note shares the process-level app id
+        and they all stack under one icon.
+        When grouping is OFF: each note gets a unique app id so Windows
+        treats it as its own pinned program.
+        """
+        from config import APP_NAME, APP_VERSION
+        group = self.config.get("group_in_taskbar", True)
+        base = f"LukeCGG.{APP_NAME}.{APP_VERSION}"
+        for nid, win in self.windows.items():
+            try:
+                if group:
+                    _set_window_app_id(win, base)
+                else:
+                    _set_window_app_id(win, f"{base}.note.{nid[:12]}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Couldn't set per-window app id: %s", exc)
 
     # ── Sign in / Sign out ─────────────────────────────────────────────
 
@@ -1339,6 +1477,7 @@ class AppController(QObject):
         self.windows[note.id] = win
         if self._visibility.get(note.id, True):
             win.show()
+        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     def _refresh_window(self, note_id: str):
         win = self.windows.get(note_id)

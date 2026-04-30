@@ -14,7 +14,9 @@ from PySide6.QtGui import (
 _ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 
-def _render_pixmap(size: int) -> QPixmap:
+def _render_pixmap(size: int, bg_color: str = "#FFF475",
+                   border_color: str = "#E0D85A",
+                   k_color: str = "#555") -> QPixmap:
     pix = QPixmap(size, size)
     pix.fill(QColor(0, 0, 0, 0))
 
@@ -29,8 +31,8 @@ def _render_pixmap(size: int) -> QPixmap:
     rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
 
     # Sticky-note background.
-    painter.setBrush(QColor("#FFF475"))
-    painter.setPen(QColor("#E0D85A"))
+    painter.setBrush(QColor(bg_color))
+    painter.setPen(QColor(border_color))
     painter.drawRoundedRect(rect, radius, radius)
 
     # Subtle notepad horizontal rules, clipped to the rounded rect.
@@ -74,10 +76,10 @@ def _render_pixmap(size: int) -> QPixmap:
             rect.center().y() - br.center().y(),
         )
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#555"))
+        painter.setBrush(QColor(k_color))
         painter.drawPath(path)
     else:
-        _draw_geometric_k(painter, rect, s)
+        _draw_geometric_k(painter, rect, s, QColor(k_color))
 
     painter.end()
     return pix
@@ -99,9 +101,10 @@ def _glyph_path(font: QFont, char: str) -> QPainterPath | None:
     return path
 
 
-def _draw_geometric_k(painter: QPainter, rect: QRectF, s: float) -> None:
+def _draw_geometric_k(painter: QPainter, rect: QRectF, s: float,
+                      color: QColor = None) -> None:
     """Render the letter K from primitive lines, no font required."""
-    pen = QPen(QColor("#555"))
+    pen = QPen(color or QColor("#555"))
     pen.setWidthF(max(2.0, 6 * s))
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -121,11 +124,26 @@ def _draw_geometric_k(painter: QPainter, rect: QRectF, s: float) -> None:
                      int(arm_x), int(cy + half_h))
 
 
-def make_icon() -> QIcon:
-    """Return a QIcon containing the K note rendered at multiple sizes."""
+def make_icon(color_hex: str | None = None) -> QIcon:
+    """Return a QIcon containing the K note rendered at multiple sizes.
+
+    If ``color_hex`` is given, the sticky-note background is tinted to
+    that colour (used by per-note taskbar icons). The K text colour is
+    auto-chosen for contrast.
+    """
+    if color_hex is None:
+        bg, border, k = "#FFF475", "#E0D85A", "#555"
+    else:
+        bg = color_hex
+        c = QColor(color_hex)
+        border = c.darker(115).name()
+        # Pick black or white "K" depending on background luminance.
+        # Standard relative luminance approximation.
+        lum = (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) / 255
+        k = "#222" if lum > 0.55 else "#f1f3f4"
     icon = QIcon()
     for s in _ICON_SIZES:
-        icon.addPixmap(_render_pixmap(s))
+        icon.addPixmap(_render_pixmap(s, bg, border, k))
     return icon
 
 
