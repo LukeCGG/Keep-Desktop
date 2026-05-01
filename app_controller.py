@@ -1653,6 +1653,7 @@ class AppController(QObject):
 
     def _apply_remote_notes(self, remote_notes: list):
         """Apply remote note data on the main thread."""
+        from sync_merge import decide_merge, MergeAction
         log.info("Applying %d remote notes (local dirty=%s)",
                  len(remote_notes), [d[:8] for d in self._dirty])
         new_remote_ids: list[str] = []
@@ -1670,34 +1671,36 @@ class AppController(QObject):
                 if self._visibility.get(rn.id, False):
                     self._add_window_for_note(rn)
             else:
-                # Update sort/pin info always
+                # Update sort/pin info always — these aren't user-edit
+                # surfaces so they can't conflict with typing.
                 existing.sort_key = rn.sort_key
                 existing.pinned = rn.pinned
-                # Only update content if not locally dirty
-                if rn.id in self._dirty:
+                # Compute merge decision with the user's editing state.
+                win = self.windows.get(rn.id)
+                last_edit = self._last_edit_time.get(rn.id, 0.0)
+                idle_for = time.monotonic() - last_edit
+                user_busy = bool(
+                    win and win.text_edit.hasFocus()
+                    and idle_for < self._edit_idle_seconds
+                )
+                decision = decide_merge(
+                    local=existing,
+                    remote=rn,
+                    is_dirty=(rn.id in self._dirty),
+                    user_busy=user_busy,
+                )
+
+                if decision.action is MergeAction.SKIP_DIRTY:
                     log.info("Skipping remote update for %s (locally dirty)", rn.id[:8])
                     continue
-                # Detect what changed for diagnostics
+
+                # Diagnostics
                 changes = []
-                text_changed = (existing.text != rn.text)
-                title_changed = (existing.title != rn.title)
-                color_changed = (existing.color_hex != rn.color_hex)
-                list_changed = (existing.is_list != rn.is_list
-                                or existing.list_items != rn.list_items)
-                # Format-only change: same plain text, but the decoded
-                # HTML differs (web added bold, italic, etc.). We still
-                # want to refresh the window so the new formatting
-                # shows up without requiring the user to close/reopen.
-                html_changed = (
-                    not text_changed
-                    and bool(rn.html)
-                    and (rn.html != (existing.html or ""))
-                )
-                if color_changed:
+                if decision.color_changed:
                     changes.append(f"color {existing.color_hex}->{rn.color_hex}")
-                if title_changed:
+                if decision.title_changed:
                     changes.append("title")
-                if text_changed:
+                if decision.text_changed:
                     changes.append("text")
                 if existing.is_list != rn.is_list:
                     changes.append(f"is_list {existing.is_list}->{rn.is_list}")
@@ -1705,64 +1708,45 @@ class AppController(QObject):
                     changes.append(
                         f"list_items ({len(existing.list_items)}->{len(rn.list_items)})"
                     )
-                if html_changed:
+                if decision.html_changed:
                     changes.append("formatting")
                 if changes:
                     log.info("Note %s changed: %s", rn.id[:8], ", ".join(changes))
 
-                # Always overwrite local data with Keep data EXCEPT html.
-                # Keep doesn't store rich-text formatting, so we keep the
-                # local html unless the plain text actually changed (in
-                # which case the local html is stale and would re-introduce
-                # outdated content).
-                # SAFETY: if remote text is empty but local has content,
-                # treat as a suspicious fetch (decode failure, partial
-                # response, etc.) and skip the body update so we don't
-                # silently destroy the user's data.
-                if (not (rn.text or "").strip()
-                        and (existing.text or "").strip()):
+                if decision.action is MergeAction.PRESERVE_LOCAL_BODY:
                     log.warning(
                         "Note %s: remote text empty but local non-empty "
                         "(%d chars). Skipping body overwrite.",
                         rn.id[:8], len(existing.text or ""),
                     )
-                else:
-                    existing.text = rn.text
-                    if text_changed:
-                        existing.html = ""  # text changed remotely — stale html
-                    # Only adopt remote html when text is non-empty (or both are empty).
-                    if rn.html and rn.text:
-                        existing.html = rn.html
+                    # Still adopt safe metadata (title, colour, pin).
+                    existing.title = rn.title
+                    if decision.color_changed:
+                        existing.dark_mode = False
+                    existing.color_hex = rn.color_hex
+                    continue
+
+                # ADOPT_REMOTE — full body update.
+                existing.text = rn.text
+                if decision.text_changed:
+                    existing.html = ""  # text changed remotely — stale html
+                # Only adopt remote html when text is non-empty (or both are empty).
+                if rn.html and rn.text:
+                    existing.html = rn.html
                 existing.title = rn.title
-                if color_changed:
+                if decision.color_changed:
                     # User changed colour on the web → drop our local
                     # dark-mode override so we follow the new colour.
                     existing.dark_mode = False
                 existing.color_hex = rn.color_hex
                 existing.list_items = rn.list_items
                 existing.is_list = rn.is_list
-                # Only refresh the window if user is NOT actively typing,
-                # AND something visible actually changed. A no-op refresh
-                # would call setPlainText and silently wipe rich-text
-                # formatting the user just applied.
-                win = self.windows.get(rn.id)
-                visible_changed = (text_changed or title_changed
-                                   or color_changed or list_changed
-                                   or html_changed)
-                # Treat the user as "actively editing" only if the
-                # window has focus AND they've typed within the last
-                # _edit_idle_seconds. Otherwise refresh through so
-                # remote changes show up in already-open windows.
-                last_edit = self._last_edit_time.get(rn.id, 0.0)
-                idle_for = time.monotonic() - last_edit
-                user_busy = (win and win.text_edit.hasFocus()
-                             and idle_for < self._edit_idle_seconds)
                 if user_busy:
                     log.info(
                         "Skipping refresh for %s (user editing, idle %.1fs)",
                         rn.id[:8], idle_for,
                     )
-                elif win and visible_changed:
+                elif decision.refresh_window:
                     log.info("Refreshing window %s", rn.id[:8])
                     self._refresh_window(rn.id)
 

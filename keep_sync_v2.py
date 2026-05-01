@@ -317,9 +317,15 @@ class KeepSyncV2:
         self, keep_note: KeepNote,
         *, is_pinned: Optional[bool] = None,
         sort_value: Optional[int] = None,
+        new_color: Optional[str] = None,
     ) -> bool:
-        """Push metadata-only changes (pin/sort/title) to Keep without
-        rewriting the note body.
+        """Push metadata-only changes (pin/sort/title/colour) to Keep
+        without rewriting the note body.
+
+        Works for notes that have no sct_id (i.e. ones that have never
+        been touched by Keep web's docs-nestedModel). When ``new_color``
+        is left as None we infer it from ``keep_note.color_hex`` so
+        callers don't have to translate hex→wire-name themselves.
 
         Works for notes that have no sct_id (i.e. ones that have never
         been touched by Keep web's docs-nestedModel).
@@ -343,12 +349,20 @@ class KeepSyncV2:
                         keep_note.id,
                     )
                     return False
+            # Translate hex→wire-name if caller didn't pass one
+            # explicitly. Don't push a colour change unless local
+            # actually differs from server, to avoid spurious writes.
+            if new_color is None and keep_note.color_hex:
+                wire = _hex_to_wire_color(keep_note.color_hex)
+                if wire and wire != server.color:
+                    new_color = wire
             try:
                 self._client.update_note_metadata(
                     server,
                     is_pinned=is_pinned,
                     sort_value=sort_value,
                     new_title=keep_note.title,
+                    new_color=new_color,
                 )
             except KeepError as exc:
                 log.error(
@@ -357,8 +371,8 @@ class KeepSyncV2:
                 )
                 return False
             log.info(
-                "metadata push ok for %s (pinned=%s sort=%s)",
-                keep_note.id[:8], is_pinned, sort_value,
+                "metadata push ok for %s (pinned=%s sort=%s color=%s)",
+                keep_note.id[:8], is_pinned, sort_value, new_color,
             )
             return True
 
@@ -415,6 +429,23 @@ class KeepSyncV2:
                     keep_note.id[:12],
                 )
                 return True
+
+            # Mirror local colour onto the server snapshot so any of
+            # the downstream push paths (diff, list-replace, legacy
+            # text) include the new colour in their node payload. Keep
+            # has no separate colour-only endpoint; colour rides along
+            # with the next body write.
+            wire_color = _hex_to_wire_color(keep_note.color_hex)
+            if wire_color and wire_color != server.color:
+                server.color = wire_color
+                if isinstance(server.raw, dict):
+                    server.raw["color"] = wire_color
+            # Mirror pinned the same way (mostly cosmetic — pinned is
+            # usually pushed via push_metadata — but harmless if local
+            # state diverges).
+            if isinstance(server.raw, dict):
+                server.raw["isPinned"] = bool(keep_note.pinned)
+            server.is_pinned = bool(keep_note.pinned)
 
             # Lists: handled by `replace_list_items` (full-replace
             # strategy). Trigger when EITHER the server already says

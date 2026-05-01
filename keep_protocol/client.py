@@ -609,6 +609,7 @@ class KeepClient:
             "title": new_title if new_title is not None else (raw.get("title", note.title) or ""),
             "isArchived": bool(raw.get("isArchived", note.is_archived)),
             "isPinned": bool(raw.get("isPinned", note.is_pinned)),
+            "color": raw.get("color") or note.color or "DEFAULT",
             "nodeSettings": dict(raw.get("nodeSettings") or {"graveyardState": "EXPANDED"}),
             "tasks": list(raw.get("tasks") or []),
             "clientChanges": {
