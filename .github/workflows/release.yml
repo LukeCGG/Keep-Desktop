@@ -26,9 +26,15 @@ jobs:
       - name: Install dependencies
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          # Sanity check: every release has been broken at least once
+          # by a silent pip failure. Verify the critical imports BEFORE
+          # the build steps run.
+          python -c "import PySide6, gkeepapi, gpsoauth, keyring, requests; print('deps ok')"
 
       - name: Determine version
         id: ver
