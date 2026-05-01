@@ -1,11 +1,15 @@
 """Individual sticky-note window widget."""
 
 from PySide6.QtCore import Qt, Signal, QPoint, QSize, QEvent
-from PySide6.QtGui import QFont, QColor, QCursor, QPainter, QPen, QTextCharFormat
+from PySide6.QtGui import (
+    QFont, QColor, QCursor, QPainter, QPen,
+    QTextCharFormat, QTextBlockFormat, QTextCursor, QAction,
+    QSyntaxHighlighter,
+)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel, QLineEdit,
     QPushButton, QMenu, QSizeGrip, QGraphicsDropShadowEffect,
-    QGridLayout,
+    QGridLayout, QToolButton,
 )
 
 from config import (
@@ -139,6 +143,25 @@ class FormattingToolbar(QWidget):
         self.strike_btn.clicked.connect(self._toggle_strikethrough)
         layout.addWidget(self.strike_btn)
 
+        # Heading dropdown (Body / Heading 1 / Heading 2). Mirrors
+        # Keep web's paragraph-style picker.
+        self.heading_btn = QToolButton(self)
+        self.heading_btn.setText("\u00b6")  # pilcrow
+        self.heading_btn.setToolTip("Paragraph style")
+        self.heading_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.heading_btn.setFixedSize(30, 24)
+        self.heading_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        h_menu = QMenu(self.heading_btn)
+        h_menu.setStyleSheet(_LIGHT_MENU_QSS)
+        for label, level in (("Body text", 0),
+                             ("Heading 1", 1),
+                             ("Heading 2", 2)):
+            act = QAction(label, h_menu)
+            act.triggered.connect(lambda _checked=False, lv=level: self._set_heading(lv))
+            h_menu.addAction(act)
+        self.heading_btn.setMenu(h_menu)
+        layout.addWidget(self.heading_btn)
+
         self.clear_fmt_btn = self._make_btn("T\u02e3")
         self.clear_fmt_btn.setCheckable(False)
         self.clear_fmt_btn.setToolTip(
@@ -196,6 +219,46 @@ class FormattingToolbar(QWidget):
         fmt.setFontStrikeOut(not fmt.fontStrikeOut())
         self._text_edit.mergeCurrentCharFormat(fmt)
 
+    def _set_heading(self, level: int):
+        """Apply heading level (0 = body, 1 = H1, 2 = H2) to every
+        block touched by the current selection (or just the cursor's
+        block if nothing is selected)."""
+        cursor = self._text_edit.textCursor()
+        # Sizes match Keep web's heading scale: H1 ~1.5x, H2 ~1.25x.
+        sizes = {0: 10.0, 1: 16.0, 2: 13.0}
+        target_size = sizes.get(level, 10.0)
+        cursor.beginEditBlock()
+        if cursor.hasSelection():
+            start, end = sorted((cursor.anchor(), cursor.position()))
+        else:
+            start = end = cursor.position()
+        # Walk every block in [start, end].
+        c = QTextCursor(self._text_edit.document())
+        c.setPosition(start)
+        c.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        while True:
+            bf = QTextBlockFormat(c.blockFormat())
+            bf.setHeadingLevel(level)
+            c.setBlockFormat(bf)
+            # Update font size of all chars in this block so the new
+            # style is visible immediately (Qt won't restyle existing
+            # runs from heading level alone).
+            block_start = c.block().position()
+            block_end = block_start + c.block().length() - 1
+            cf = QTextCharFormat()
+            cf.setFontPointSize(target_size)
+            sel = QTextCursor(self._text_edit.document())
+            sel.setPosition(block_start)
+            sel.setPosition(block_end, QTextCursor.MoveMode.KeepAnchor)
+            sel.mergeCharFormat(cf)
+            if c.block().position() + c.block().length() - 1 >= end:
+                break
+            if not c.movePosition(QTextCursor.MoveOperation.NextBlock):
+                break
+        cursor.endEditBlock()
+        self._text_edit.setFocus()
+        self._update_states()
+
     def _clear_formatting(self):
         """Strip rich-text formatting from the selection (or whole note)."""
         cursor = self._text_edit.textCursor()
@@ -212,6 +275,9 @@ class FormattingToolbar(QWidget):
         self.italic_btn.setChecked(fmt.fontItalic())
         self.underline_btn.setChecked(fmt.fontUnderline())
         self.strike_btn.setChecked(fmt.fontStrikeOut())
+        # Reflect current paragraph style on the dropdown label.
+        level = self._text_edit.textCursor().blockFormat().headingLevel()
+        self.heading_btn.setText({1: "H1", 2: "H2"}.get(level, "\u00b6"))
 
     def update_color(self, color_hex):
         darker = QColor(color_hex).darker(105).name()
@@ -238,6 +304,15 @@ class FormattingToolbar(QWidget):
         for b in (self.bold_btn, self.italic_btn, self.underline_btn,
                   self.strike_btn, self.clear_fmt_btn):
             b.setStyleSheet(qss)
+        # QToolButton needs slightly different selectors for the popup arrow.
+        self.heading_btn.setStyleSheet(
+            "QToolButton {"
+            f"  border: none; border-radius: 3px; color: {color};"
+            "  background: transparent; padding: 0 4px;"
+            "}"
+            f"QToolButton:hover {{ background: {hover}; }}"
+            "QToolButton::menu-indicator { image: none; width: 0; }"
+        )
 
 
 # ── Title Bar ──────────────────────────────────────────────────────────
@@ -478,20 +553,61 @@ class TitleBar(QWidget):
             win.save_geometry()
 
 
+class _LinkHighlighter(QSyntaxHighlighter):
+    """Visually mark URLs/emails in the note body with blue underline,
+    matching the convention used by Keep web and most rich editors.
+
+    Pure styling — does NOT change the underlying text or affect the
+    HTML we round-trip to Keep. The format is reapplied on every text
+    change so it tracks edits live.
+    """
+
+    # Same pattern as NoteTextEdit, kept duplicated so the highlighter
+    # can be a top-level class and not depend on import order.
+    _LINK_RE = __import__("re").compile(
+        r"(mailto:[^\s<>]+|https?://[^\s<>]+|www\.[^\s<>]+|"
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    )
+
+    def __init__(self, document):
+        super().__init__(document)
+        self._fmt = QTextCharFormat()
+        self._fmt.setForeground(QColor("#1a73e8"))  # Google's link blue
+        self._fmt.setFontUnderline(True)
+
+    def highlightBlock(self, text: str) -> None:
+        for m in self._LINK_RE.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), self._fmt)
+
+
 class NoteTextEdit(QTextEdit):
     """Rich text editor area for the note body."""
+
+    # URL/email detection: matches http(s)://, www., and bare email/mailto:.
+    _LINK_RE = __import__("re").compile(
+        r"(mailto:[^\s<>]+|https?://[^\s<>]+|www\.[^\s<>]+|"
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFont(QFont("Segoe UI", 10))
         self.setAcceptRichText(True)
+        # Qt's built-in HTML renderer applies font-weight:bold to <h1>
+        # and <h2> by default. Keep web does NOT — headings there are
+        # only larger, not bold (unless the user actually toggles bold).
+        # Override the default style sheet so our rendering matches.
+        self.document().setDefaultStyleSheet(
+            "h1, h2, h3, h4, h5, h6 { font-weight: normal; }"
+        )
         self.setStyleSheet("""
             QTextEdit {
                 border: none;
                 background: transparent;
                 padding: 8px;
                 color: #333;
-                selection-background-color: rgba(0,0,0,0.15);
+                selection-color: #000;
+                selection-background-color: rgba(66,133,244,0.35);
             }
             QScrollBar:vertical {
                 width: 6px; background: transparent;
@@ -505,8 +621,76 @@ class NoteTextEdit(QTextEdit):
             }
         """)
         self.setPlaceholderText("Type your note here...")
+        # Required so mouseMoveEvent fires during Ctrl+hover (not just
+        # while a button is held).
+        self.viewport().setMouseTracking(True)
+        self.setMouseTracking(True)
+        # Visual styling for URLs/emails (blue + underline). Click
+        # behaviour stays Ctrl+click via mousePressEvent below.
+        self._link_highlighter = _LinkHighlighter(self.document())
+
+    # ── Ctrl+click link activation ─────────────────────────────────────
+
+    def _link_at(self, pos):
+        """Return (url_string, char_start, char_end) for the URL at the
+        given viewport position, or None if there isn't one."""
+        cursor = self.cursorForPosition(pos)
+        block = cursor.block()
+        if not block.isValid():
+            return None
+        block_text = block.text()
+        col = cursor.positionInBlock()
+        for m in self._LINK_RE.finditer(block_text):
+            if m.start() <= col <= m.end():
+                url = m.group(0)
+                # Strip common trailing punctuation that's almost
+                # certainly not part of the URL (sentence-final
+                # period, comma, closing bracket, etc.).
+                stripped = url.rstrip(").,;:!?]\u201d\u2019")
+                return (
+                    stripped,
+                    block.position() + m.start(),
+                    block.position() + m.start() + len(stripped),
+                )
+        return None
+
+    def _open_link(self, url: str) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        if url.startswith("www."):
+            url = "https://" + url
+        elif "@" in url and not url.startswith("mailto:") and "://" not in url:
+            url = "mailto:" + url
+        QDesktopServices.openUrl(QUrl(url))
+
+    def mouseMoveEvent(self, event):
+        # Show the pointing-hand cursor when Ctrl is held over a URL,
+        # matching the convention used by IDEs and rich-text editors.
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self._link_at(event.pos()):
+                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        super().mouseMoveEvent(event)
+
+    def keyReleaseEvent(self, event):
+        # Restore I-beam when Ctrl is released so the cursor doesn't
+        # stay stuck as a hand.
+        if event.key() in (Qt.Key.Key_Control,):
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        super().keyReleaseEvent(event)
 
     def mousePressEvent(self, event):
+        # Ctrl+left-click on a URL/email opens it in the system handler.
+        if (event.button() == Qt.MouseButton.LeftButton
+                and (event.modifiers() & Qt.KeyboardModifier.ControlModifier)):
+            link = self._link_at(event.pos())
+            if link is not None:
+                self._open_link(link[0])
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton:
             cursor = self.cursorForPosition(event.pos())
             block = cursor.block()
@@ -855,13 +1039,27 @@ class NoteWindow(QWidget):
             }}
         """)
         self.text_edit.setStyleSheet(self.text_edit.styleSheet())  # ensure repaint
+        # In dark mode, give the selection a brighter background AND keep
+        # text white so it stays readable. In light mode the constructor
+        # default (black-on-blue-tint) handles things; here we override
+        # for dark.
+        if self._dark_mode:
+            sel_qss = (
+                "selection-color: #ffffff;"
+                "selection-background-color: rgba(138,180,248,0.45);"
+            )
+        else:
+            sel_qss = (
+                "selection-color: #000000;"
+                "selection-background-color: rgba(66,133,244,0.35);"
+            )
         self.text_edit.setStyleSheet(f"""
             QTextEdit {{
                 border: none;
                 background: transparent;
                 padding: 8px;
                 color: {text_color};
-                selection-background-color: rgba(255,255,255,0.18);
+                {sel_qss}
             }}
             QScrollBar:vertical {{ width: 6px; background: transparent; }}
             QScrollBar::handle:vertical {{
@@ -1034,7 +1232,10 @@ class NoteWindow(QWidget):
 
     def save_geometry(self):
         geo = self.geometry()
-        set_position(self.note_id, geo.x(), geo.y(), geo.width(), geo.height())
+        set_position(
+            self.note_id, geo.x(), geo.y(), geo.width(), geo.height(),
+            pinned=getattr(self.title_bar, "_pinned", False),
+        )
 
     def moveEvent(self, event):
         super().moveEvent(event)

@@ -34,3 +34,7 @@ keep_token.dat
 notes.json
 positions.json
 config.json
+
+# Local-only dev archive (keep-protocol reverse-engineering project)
+archive/
+

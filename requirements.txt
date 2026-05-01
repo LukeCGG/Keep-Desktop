@@ -1,2 +1,8 @@
 PySide6>=6.6
+PySide6-WebEngine>=6.6
+# Auth/protocol stack for the new docs-nestedModel sync. gkeepapi is kept
+# as a fallback for one release (set keep_protocol_v2:false in config).
 gkeepapi>=0.15
+gpsoauth>=1.0
+keyring>=24
+requests>=2.31

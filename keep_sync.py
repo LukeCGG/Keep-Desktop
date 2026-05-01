@@ -234,6 +234,20 @@ class KeepSync:
             except Exception as exc:
                 log.error("Error pushing note %s: %s", keep_note.id, exc)
 
+    def push_metadata(self, keep_note: KeepNote, *,
+                      is_pinned=None, sort_value=None) -> bool:
+        """v1 has no separate metadata write path — gkeepapi pushes
+        everything together. Apply the metadata to the local note then
+        delegate to push_note().
+        """
+        if is_pinned is not None:
+            keep_note.pinned = bool(is_pinned)
+        # gkeepapi doesn't expose sortValue directly; the v1 path can't
+        # actually reorder notes on Keep. We still push so the rest
+        # (title, color, pin) syncs.
+        self.push_note(keep_note)
+        return True
+
     def create_note(self, title="", text="", color_hex="#FFF475") -> KeepNote | None:
         """Create a new note on Keep and return its mirror."""
         if not self._authenticated:

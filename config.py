@@ -6,7 +6,7 @@ import sys
 import winreg
 
 APP_NAME = "KeepDesktop"
-APP_VERSION = "1.0.8"
+APP_VERSION = "2.0.0"
 # GitHub repository (owner/name) used for the auto-updater.
 GITHUB_REPO = "LukeCGG/Keep-Desktop"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +87,10 @@ def load_config():
         "autostart": False,
         "always_on_top": False,
         "opacity": 0.95,
+        # Use the new keep_protocol-based sync (decodes/encodes Keep's
+        # docs-nestedModel formatting state). Falls back to gkeepapi
+        # when False. Default ON for new installs from 1.1.0 onward.
+        "keep_protocol_v2": True,
     }
     saved = load_json(CONFIG_FILE, {})
     # Merge: saved values win, defaults fill in any missing keys
@@ -111,9 +115,13 @@ def get_position(note_id):
     return positions.get(note_id, None)
 
 
-def set_position(note_id, x, y, w, h):
+def set_position(note_id, x, y, w, h, pinned=None):
     positions = load_positions()
-    positions[note_id] = {"x": x, "y": y, "w": w, "h": h}
+    entry = positions.get(note_id, {}) or {}
+    entry.update({"x": x, "y": y, "w": w, "h": h})
+    if pinned is not None:
+        entry["pinned"] = bool(pinned)
+    positions[note_id] = entry
     save_positions(positions)
 
 

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 import uuid
 import threading
 from functools import partial
@@ -35,7 +36,12 @@ def _set_window_app_id(window, app_id: str) -> None:
     """Set per-window AppUserModelID via IPropertyStore so Windows can
     group (or refuse to group) this HWND in the taskbar.
 
-    No-op on non-Windows. Failures are non-fatal and logged by the caller.
+    No-op on non-Windows. Failures raise OSError so the caller can log
+    the HRESULT.
+
+    IMPORTANT: changing the AppUserModelID of a window that is already
+    visible has NO effect on its existing taskbar button. The window
+    must be hidden, the property changed, and the window shown again.
     """
     import sys
     if sys.platform != "win32":
@@ -44,7 +50,6 @@ def _set_window_app_id(window, app_id: str) -> None:
     from ctypes import wintypes
     hwnd = int(window.winId())
 
-    # SHGetPropertyStoreForWindow + IPropertyStore::SetValue(PKEY_AppUserModel_ID).
     class GUID(ctypes.Structure):
         _fields_ = [("Data1", ctypes.c_uint32),
                     ("Data2", ctypes.c_uint16),
@@ -54,17 +59,19 @@ def _set_window_app_id(window, app_id: str) -> None:
     class PROPERTYKEY(ctypes.Structure):
         _fields_ = [("fmtid", GUID), ("pid", ctypes.c_uint32)]
 
+    # PROPVARIANT is 24 bytes on x64. We only need the LPWSTR variant;
+    # use a c_void_p for the union slot so InitPropVariantFromString /
+    # PropVariantClear can manage the buffer via CoTaskMemAlloc/Free.
     class PROPVARIANT(ctypes.Structure):
         _fields_ = [
             ("vt", ctypes.c_ushort),
             ("wReserved1", ctypes.c_ushort),
             ("wReserved2", ctypes.c_ushort),
             ("wReserved3", ctypes.c_ushort),
-            ("pwszVal", ctypes.c_wchar_p),
-            ("padding", ctypes.c_uint64),
+            ("data1", ctypes.c_void_p),   # union slot 1 (pwszVal etc.)
+            ("data2", ctypes.c_void_p),   # union slot 2 (padding)
         ]
 
-    # IPropertyStore IID and PKEY_AppUserModel_ID.
     IID_IPropertyStore = GUID(
         0x886D8EEB, 0x8CF2, 0x4446,
         (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99),
@@ -78,11 +85,20 @@ def _set_window_app_id(window, app_id: str) -> None:
     shell32 = ctypes.windll.shell32
     ole32 = ctypes.windll.ole32
 
-    # InitPropVariantFromString equivalent.
-    PropVariantInit = ole32.PropVariantInit
-    PropVariantInit.argtypes = [ctypes.POINTER(PROPVARIANT)]
+    # Build a VT_LPWSTR PROPVARIANT manually instead of relying on
+    # propsys!InitPropVariantFromString — that export is missing on
+    # some Windows builds / ctypes views (we hit "function not found"
+    # in the wild). The shape is well-defined: vt=31 (VT_LPWSTR) and
+    # the union slot holds a pointer to a wide string allocated with
+    # CoTaskMemAlloc. PropVariantClear will CoTaskMemFree it for us.
+    VT_LPWSTR = 31
+    CoTaskMemAlloc = ole32.CoTaskMemAlloc
+    CoTaskMemAlloc.argtypes = [ctypes.c_size_t]
+    CoTaskMemAlloc.restype = ctypes.c_void_p
+
     PropVariantClear = ole32.PropVariantClear
     PropVariantClear.argtypes = [ctypes.POINTER(PROPVARIANT)]
+    PropVariantClear.restype = ctypes.c_long
 
     SHGetPropertyStoreForWindow = shell32.SHGetPropertyStoreForWindow
     SHGetPropertyStoreForWindow.argtypes = [
@@ -95,32 +111,118 @@ def _set_window_app_id(window, app_id: str) -> None:
         hwnd, ctypes.byref(IID_IPropertyStore), ctypes.byref(pStore)
     )
     if hr != 0 or not pStore.value:
-        raise OSError(f"SHGetPropertyStoreForWindow hr=0x{hr & 0xFFFFFFFF:08X}")
+        raise OSError(
+            f"SHGetPropertyStoreForWindow hwnd=0x{hwnd:X} "
+            f"hr=0x{hr & 0xFFFFFFFF:08X}"
+        )
 
-    # IPropertyStore vtable: [QueryInterface, AddRef, Release, GetCount,
-    #                         GetAt, GetValue, SetValue, Commit]
-    vtbl = ctypes.cast(pStore, ctypes.POINTER(ctypes.c_void_p))[0]
+    # IPropertyStore vtable: 0=QueryInterface 1=AddRef 2=Release
+    # 3=GetCount 4=GetAt 5=GetValue 6=SetValue 7=Commit
+    vtbl_ptr = ctypes.cast(pStore, ctypes.POINTER(ctypes.c_void_p))[0]
+    vtbl = ctypes.cast(vtbl_ptr, ctypes.POINTER(ctypes.c_void_p))
     SetValue = ctypes.WINFUNCTYPE(
         ctypes.c_long, ctypes.c_void_p,
         ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT),
-    )(ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[6])
-    Commit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(
-        ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[7]
-    )
-    Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(
-        ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[2]
-    )
+    )(vtbl[6])
+    Commit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtbl[7])
+    Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
 
     pv = PROPVARIANT()
-    PropVariantInit(ctypes.byref(pv))
-    pv.vt = 31  # VT_LPWSTR
-    pv.pwszVal = ctypes.c_wchar_p(app_id)
     try:
-        SetValue(pStore, ctypes.byref(PKEY_AppUserModel_ID), ctypes.byref(pv))
-        Commit(pStore)
+        # Allocate a CoTaskMem-owned wide-char copy of app_id (with NUL),
+        # then populate the PROPVARIANT manually.
+        nbytes = (len(app_id) + 1) * ctypes.sizeof(ctypes.c_wchar)
+        buf = CoTaskMemAlloc(nbytes)
+        if not buf:
+            raise OSError("CoTaskMemAlloc failed")
+        ctypes.memmove(
+            buf,
+            ctypes.create_unicode_buffer(app_id),
+            nbytes,
+        )
+        pv.vt = VT_LPWSTR
+        pv.data1 = buf
+        hr = SetValue(pStore, ctypes.byref(PKEY_AppUserModel_ID),
+                      ctypes.byref(pv))
+        if hr != 0:
+            raise OSError(
+                f"IPropertyStore::SetValue hr=0x{hr & 0xFFFFFFFF:08X}"
+            )
+        hr = Commit(pStore)
+        if hr != 0:
+            raise OSError(
+                f"IPropertyStore::Commit hr=0x{hr & 0xFFFFFFFF:08X}"
+            )
+        log.debug("AppUserModelID set on hwnd=0x%X -> %r", hwnd, app_id)
     finally:
         PropVariantClear(ctypes.byref(pv))
         Release(pStore)
+
+
+def _force_foreground(window) -> None:
+    """Force ``window`` into the Windows foreground.
+
+    SetForegroundWindow is normally blocked when our process doesn't
+    own the active foreground (which is the case when called from a
+    tray-icon callback). We combine three workarounds, each of which
+    independently bypasses the restriction in different scenarios:
+
+      1. Synthesise an ALT keystroke. Windows treats any pending input
+         from our thread as an "active" signal and lifts the lock.
+      2. AttachThreadInput to the foreground thread's input queue, so
+         our SetForegroundWindow looks like it came from that thread.
+      3. SystemParametersInfo SPI_SETFOREGROUNDLOCKTIMEOUT = 0 around
+         the call, then restore the previous timeout.
+
+    No-op on non-Windows or if the underlying APIs fail.
+    """
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd = int(window.winId())
+
+        # Workaround 1: ALT keystroke — unblocks SetForegroundWindow.
+        VK_MENU = 0x12
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+
+        # Workaround 3: relax the foreground-lock timeout so other
+        # processes can't race us. We don't bother restoring it —
+        # leaving it at 0 only affects our own process and Windows
+        # resets it on the next foreground change anyway.
+        SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+        SPIF_SENDCHANGE = 0x0002
+        user32.SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_SENDCHANGE,
+        )
+
+        # Workaround 2: attach input queues, then promote the window.
+        fg = user32.GetForegroundWindow()
+        our_tid = kernel32.GetCurrentThreadId()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        attached = False
+        if fg_tid and fg_tid != our_tid:
+            attached = bool(user32.AttachThreadInput(fg_tid, our_tid, True))
+        try:
+            # If minimised, restore first — SetForegroundWindow on a
+            # minimised window leaves it minimised.
+            SW_RESTORE = 9
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetFocus(hwnd)
+            user32.SetActiveWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(fg_tid, our_tid, False)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _load_visibility() -> dict:
@@ -368,6 +470,7 @@ class NoteManagerDialog(QDialog):
     note_create_requested = Signal()  # emitted when user clicks "New note"
     visibility_changed = Signal(str, bool)  # note_id, is_visible (live)
     checklist_toggle_requested = Signal(str)  # note_id
+    pin_toggle_requested = Signal(str)        # note_id (Keep is_pinned)
     reorder_requested = Signal(str, str)      # note_id, action: top|up|down|bottom
 
     def __init__(self, notes: dict, visibility: dict, parent=None):
@@ -485,8 +588,11 @@ class NoteManagerDialog(QDialog):
             visible_notes.values(),
             key=lambda n: (
                 not n.pinned,
-                # User-imposed order wins; fall back to Keep's sort_key.
-                n.local_order if n.local_order else n.sort_key,
+                # User-imposed order wins (small ascending integers).
+                # Otherwise fall back to Keep's sortValue, descending
+                # — so notes appear in the same order as keep.google.com.
+                (0, n.local_order) if n.local_order
+                else (1, -int(n.sort_key or 0)),
             ),
         )
 
@@ -691,6 +797,13 @@ class NoteManagerDialog(QDialog):
         else:
             label = "☑  Toggle checklist"
         act_check = menu.addAction(label)
+        if note is not None:
+            pin_label = ("📌  Unpin from top of Keep"
+                         if getattr(note, "pinned", False)
+                         else "📌  Pin to top of Keep")
+        else:
+            pin_label = "📌  Toggle Keep pin"
+        act_pin = menu.addAction(pin_label)
         menu.addSeparator()
         act_top = menu.addAction("⏫  Move to top")
         act_up = menu.addAction("⬆  Move up")
@@ -701,6 +814,8 @@ class NoteManagerDialog(QDialog):
             return
         if chosen is act_check:
             self.checklist_toggle_requested.emit(note_id)
+        elif chosen is act_pin:
+            self.pin_toggle_requested.emit(note_id)
         elif chosen is act_top:
             self.reorder_requested.emit(note_id, "top")
         elif chosen is act_up:
@@ -723,10 +838,32 @@ class AppController(QObject):
     def __init__(self):
         super().__init__()
         self.config = load_config()
-        self.sync = KeepSync()
+        # Pick sync backend. v2 (keep_protocol) supports docs-nestedModel
+        # formatting and won't corrupt Keep web's state. v1 (gkeepapi)
+        # is kept as a fallback for one release; see config.py.
+        if self.config.get("keep_protocol_v2", True):
+            try:
+                from keep_sync_v2 import KeepSyncV2
+                self.sync = KeepSyncV2()
+                log.info("using KeepSyncV2 (keep_protocol)")
+            except Exception as exc:  # noqa: BLE001
+                log.error("KeepSyncV2 init failed, falling back to v1: %s", exc)
+                self.sync = KeepSync()
+        else:
+            self.sync = KeepSync()
+            log.info("using KeepSync v1 (gkeepapi)")
         self.windows: dict[str, NoteWindow] = {}
         self._notes: dict[str, KeepNote] = {}
         self._dirty: set[str] = set()
+        # Per-note timestamp of the last user edit. Used to decide
+        # whether a focused note window is "actively being edited" or
+        # just sitting open — if it's been idle long enough we let
+        # remote refreshes through so web-side changes appear without
+        # the user having to close and reopen the note.
+        self._last_edit_time: dict[str, float] = {}
+        # How long after the last keystroke we still treat a note as
+        # "being edited" and refuse to overwrite it from a remote pull.
+        self._edit_idle_seconds = 15.0
         self._visibility = _load_visibility()
         self._show_in_taskbar = self.config.get("show_in_taskbar", False)
 
@@ -905,23 +1042,31 @@ class AppController(QObject):
             if self._visibility.get(note_id, True):
                 win = self._create_window(note)
                 self.windows[note_id] = win
-                # Set per-window AppUserModelID *before* first show; the
-                # taskbar reads this property when the button is created
-                # and ignores later changes unless the window is hidden
-                # and shown again.
-                self._apply_grouping_for_window(note_id, win)
+                # Show first so Qt has a chance to attach window icon
+                # to the HWND. Then _apply_taskbar_grouping below will
+                # hide/show again to register the taskbar button under
+                # the right AppUserModelID — and the icon comes along
+                # for the ride. Doing the AppID set BEFORE first show
+                # left the taskbar button with no icon.
                 win.show()
+        # Now that all initial windows have HWNDs and icons, apply the
+        # grouping. This hides + reshows each window which is the only
+        # supported way to change a window's taskbar AppID at runtime.
+        QTimer.singleShot(0, self._apply_taskbar_grouping)
 
     # ── Note management ────────────────────────────────────────────────
 
     def _create_window(self, note: KeepNote) -> NoteWindow:
+        from config import get_position
+        pos = get_position(note.id) or {}
+        was_pinned = bool(pos.get("pinned", False))
         win = NoteWindow(
             note_id=note.id,
             title=note.title,
             text=note.text,
             html=note.html,
             color_hex=note.color_hex,
-            pinned=False,
+            pinned=was_pinned,
             show_in_taskbar=self._show_in_taskbar,
             list_items=note.list_items if note.is_list else None,
             dark_mode=note.dark_mode,
@@ -940,8 +1085,8 @@ class AppController(QObject):
 
         win = self._create_window(note)
         self.windows[note_id] = win
-        self._apply_grouping_for_window(note_id, win)
         win.show()
+        QTimer.singleShot(0, lambda: self._regroup_window(note_id))
 
         if self.sync.is_authenticated:
             threading.Thread(target=self._push_new_note, args=(note,), daemon=True).start()
@@ -986,6 +1131,7 @@ class AppController(QObject):
             else:
                 note.list_items = []
             self._dirty.add(note_id)
+            self._last_edit_time[note_id] = time.monotonic()
             # Debounce: save to disk in 1s, push to Keep in 5s
             self._save_debounce.start()
             if self.sync.is_authenticated:
@@ -1063,6 +1209,23 @@ class AppController(QObject):
                 target=self.sync.push_note, args=(note,), daemon=True
             ).start()
 
+    def _toggle_note_pin(self, note_id: str):
+        """Toggle the Keep ``isPinned`` flag and sync."""
+        note = self._notes.get(note_id)
+        if note is None:
+            return
+        note.pinned = not bool(getattr(note, "pinned", False))
+        self._save_notes_to_disk()
+        self._refresh_manager_if_open()
+        if self.sync.is_authenticated:
+            new_pinned = bool(note.pinned)
+            threading.Thread(
+                target=lambda: self.sync.push_metadata(
+                    note, is_pinned=new_pinned,
+                ),
+                daemon=True,
+            ).start()
+
     @Slot(str, str)
     def _reorder_note(self, note_id: str, action: str):
         """Move ``note_id`` within the user-imposed order."""
@@ -1074,7 +1237,8 @@ class AppController(QObject):
             self._notes.values(),
             key=lambda n: (
                 not n.pinned,
-                n.local_order if n.local_order else n.sort_key,
+                (0, n.local_order) if n.local_order
+                else (1, -int(n.sort_key or 0)),
             ),
         )
         try:
@@ -1095,8 +1259,48 @@ class AppController(QObject):
         # Spacing of 10 leaves room for incremental tweaks later.
         for i, n in enumerate(ordered):
             n.local_order = (i + 1) * 10
+        # Compute a new sortValue for the moved note so Keep web mirrors
+        # the desktop order. Keep uses descending sortValue (higher =
+        # higher in list). Pick a value strictly between the new
+        # neighbours; if at an edge, bracket past them.
+        try:
+            new_idx = ordered.index(note)
+        except ValueError:
+            new_idx = idx
+        STEP = 1 << 22  # ~4M; matches Keep's typical step granularity
+        above = ordered[new_idx - 1] if new_idx > 0 else None
+        below = ordered[new_idx + 1] if new_idx < len(ordered) - 1 else None
+
+        def _sv(n):
+            try:
+                return int(n.sort_key or 0)
+            except (TypeError, ValueError):
+                return 0
+        if above is None and below is not None:
+            new_sv = _sv(below) + STEP
+        elif below is None and above is not None:
+            new_sv = _sv(above) - STEP
+        elif above is not None and below is not None:
+            a, b = _sv(above), _sv(below)
+            if a == b:
+                new_sv = a - 1  # tiebreak
+            else:
+                new_sv = (a + b) // 2
+                # Avoid collision with either neighbour.
+                if new_sv == a or new_sv == b:
+                    new_sv = a - 1
+        else:
+            new_sv = _sv(note) or STEP
+        note.sort_key = new_sv
         self._save_notes_to_disk()
         self._refresh_manager_if_open()
+        if self.sync.is_authenticated:
+            threading.Thread(
+                target=lambda: self.sync.push_metadata(
+                    note, sort_value=new_sv,
+                ),
+                daemon=True,
+            ).start()
 
     # ── Note Manager ───────────────────────────────────────────────────
 
@@ -1104,22 +1308,43 @@ class AppController(QObject):
         # If already open, just bring it forward instead of opening a duplicate
         existing = getattr(self, "_manager_dlg", None)
         if existing is not None:
-            existing.refresh(self._notes, self._visibility)
-            existing.raise_()
-            existing.activateWindow()
-            return
+            try:
+                existing.refresh(self._notes, self._visibility)
+                if existing.isMinimized():
+                    existing.setWindowState(
+                        existing.windowState() & ~Qt.WindowState.WindowMinimized
+                        | Qt.WindowState.WindowActive
+                    )
+                if not existing.isVisible():
+                    existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                _force_foreground(existing)
+                # Sometimes Windows promotes a different window between
+                # our show() and SetForegroundWindow(); a deferred retry
+                # after the next event-loop tick catches that race.
+                QTimer.singleShot(50, lambda: _force_foreground(existing))
+                return
+            except RuntimeError:
+                # Dialog was deleted from under us — fall through to recreate.
+                self._manager_dlg = None
         dlg = NoteManagerDialog(self._notes, self._visibility)
         dlg.setModal(False)
         dlg.note_deleted.connect(self._on_note_deleted)
         dlg.note_create_requested.connect(self._new_note)
         dlg.visibility_changed.connect(self._on_manager_visibility_changed)
         dlg.checklist_toggle_requested.connect(self._toggle_note_checklist)
+        dlg.pin_toggle_requested.connect(self._toggle_note_pin)
         dlg.reorder_requested.connect(self._reorder_note)
         dlg.accepted.connect(lambda: self._on_manager_accepted(dlg))
         dlg.rejected.connect(lambda: self._on_manager_closed())
         dlg.finished.connect(lambda _r: self._on_manager_closed())
         dlg.show()
         self._manager_dlg = dlg  # prevent GC
+        dlg.raise_()
+        dlg.activateWindow()
+        _force_foreground(dlg)
+        QTimer.singleShot(50, lambda: _force_foreground(dlg))
 
     def _on_manager_visibility_changed(self, note_id: str, is_visible: bool):
         """Apply a single checkbox change live (no Apply button needed)."""
@@ -1161,8 +1386,12 @@ class AppController(QObject):
                 if win is None:
                     win = self._create_window(note)
                     self.windows[note_id] = win
-                win.show()
-                win.raise_()
+                    win.show()
+                # If the window already exists & is visible, leave its
+                # z-order alone — we don't want closing the manager to
+                # punch every note window to the front.
+                elif not win.isVisible():
+                    win.show()
             else:
                 if win is not None:
                     win.save_geometry()
@@ -1195,30 +1424,67 @@ class AppController(QObject):
         # Stable per-note id so taskbar pins survive restarts.
         return f"{base}.note.{note_id[:12]}"
 
-    def _apply_grouping_for_window(self, note_id: str, win) -> None:
-        """Set the AppUserModelID on a single window. Safe to call before
-        the window is shown (preferred) or after.
+    def _regroup_window(self, note_id: str) -> None:
+        """Force-rebuild one window's taskbar button under the current
+        AppUserModelID.
+
+        Just calling hide()/setAppID()/show() is NOT enough on Windows:
+        the shell remembers the HWND's original taskbar group and
+        keeps the button in that slot. The reliable workaround is to
+        destroy the underlying native HWND so the next show() creates
+        a fresh one — Windows treats it as a new window and registers
+        it under whatever AppUserModelID is current at that moment.
+
+        We also need to restore geometry, because destroy() drops it.
         """
+        win = self.windows.get(note_id)
+        if win is None:
+            return
+        was_visible = win.isVisible()
+        # Snapshot state we need to restore after recreating the HWND.
+        geom = win.geometry()
+        # Save any in-flight geometry so a follow-on save doesn't lose it.
         try:
-            _set_window_app_id(win, self._grouping_app_id_for(note_id))
+            win.save_geometry()
+        except Exception:  # noqa: BLE001
+            pass
+
+        new_app_id = self._grouping_app_id_for(note_id)
+
+        if was_visible:
+            win.hide()
+        # Drop the native window. Qt will lazily recreate it on show().
+        # create() forces it now so we have a winId() to attach the
+        # AppUserModelID to BEFORE the window becomes visible (and is
+        # registered with the taskbar).
+        try:
+            win.destroy(destroyWindow=True, destroySubWindows=False)
+            win.create()
         except Exception as exc:  # noqa: BLE001
-            log.warning("Couldn't set per-window app id: %s", exc)
+            log.warning("HWND recreate failed for %s: %s", note_id, exc)
+
+        try:
+            _set_window_app_id(win, new_app_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Couldn't set per-window app id for %s: %s",
+                        note_id, exc)
+
+        if was_visible:
+            win.setGeometry(geom)
+            win.show()
+            # Re-assert AppID after show — some Qt builds reset window
+            # properties during the platform-window re-attach.
+            try:
+                _set_window_app_id(win, new_app_id)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _apply_taskbar_grouping(self):
-        """Update every visible note's per-window AppUserModelID and
-        force Windows to rebuild the taskbar buttons by hiding/showing
-        each window. Without the re-show, the taskbar keeps the old
-        grouping until the next launch.
+        """Rebuild the taskbar button for every visible note under the
+        current grouping setting.
         """
-        for nid, win in list(self.windows.items()):
-            was_visible = win.isVisible()
-            if was_visible:
-                # hide() destroys the taskbar button so the next show()
-                # re-registers it under the new AppID.
-                win.hide()
-            self._apply_grouping_for_window(nid, win)
-            if was_visible:
-                win.show()
+        for nid in list(self.windows.keys()):
+            self._regroup_window(nid)
 
     # ── Sign in / Sign out ─────────────────────────────────────────────
 
@@ -1344,23 +1610,46 @@ class AppController(QObject):
     def _full_sync(self):
         if not self.sync.is_authenticated:
             return
+        # Re-entrancy guard: a slow sync (large pull, retry, etc) can
+        # still be running when the next timer tick fires. Stacking
+        # them double-pushes dirty notes and can race the cache.
+        if getattr(self, "_sync_running", False):
+            log.debug("_full_sync: previous sync still running; skipping")
+            return
+        self._sync_running = True
         threading.Thread(target=self._sync_worker, daemon=True).start()
 
     def _sync_worker(self):
-        # Push dirty notes first
-        for note_id in list(self._dirty):
-            note = self._notes.get(note_id)
-            if note:
-                self.sync.push_note(note)
-            self._dirty.discard(note_id)
+        try:
+            # Push dirty notes first
+            for note_id in list(self._dirty):
+                note = self._notes.get(note_id)
+                if note:
+                    try:
+                        ok = self.sync.push_note(note)
+                    except Exception:  # noqa: BLE001
+                        log.exception("push_note crashed for %s", note_id[:8])
+                        ok = False
+                    # Keep the note in _dirty if push failed so we retry
+                    # next sync. Otherwise the local edit is silently lost.
+                    if ok is not False:
+                        self._dirty.discard(note_id)
+                else:
+                    self._dirty.discard(note_id)
 
-        # Pull remote notes
-        remote_notes = self.sync.fetch_notes()
-        # Hand back to main thread via signal (QTimer.singleShot from a
-        # worker thread is unreliable / silently dropped).
-        log.info("Sync worker emitting %d remote notes to main thread",
-                 len(remote_notes))
-        self._remote_notes_ready.emit(remote_notes)
+            # Pull remote notes
+            try:
+                remote_notes = self.sync.fetch_notes()
+            except Exception:  # noqa: BLE001
+                log.exception("fetch_notes crashed; skipping pull this cycle")
+                remote_notes = []
+            # Hand back to main thread via signal (QTimer.singleShot from a
+            # worker thread is unreliable / silently dropped).
+            log.info("Sync worker emitting %d remote notes to main thread",
+                     len(remote_notes))
+            self._remote_notes_ready.emit(remote_notes)
+        finally:
+            self._sync_running = False
 
     def _apply_remote_notes(self, remote_notes: list):
         """Apply remote note data on the main thread."""
@@ -1395,6 +1684,15 @@ class AppController(QObject):
                 color_changed = (existing.color_hex != rn.color_hex)
                 list_changed = (existing.is_list != rn.is_list
                                 or existing.list_items != rn.list_items)
+                # Format-only change: same plain text, but the decoded
+                # HTML differs (web added bold, italic, etc.). We still
+                # want to refresh the window so the new formatting
+                # shows up without requiring the user to close/reopen.
+                html_changed = (
+                    not text_changed
+                    and bool(rn.html)
+                    and (rn.html != (existing.html or ""))
+                )
                 if color_changed:
                     changes.append(f"color {existing.color_hex}->{rn.color_hex}")
                 if title_changed:
@@ -1407,6 +1705,8 @@ class AppController(QObject):
                     changes.append(
                         f"list_items ({len(existing.list_items)}->{len(rn.list_items)})"
                     )
+                if html_changed:
+                    changes.append("formatting")
                 if changes:
                     log.info("Note %s changed: %s", rn.id[:8], ", ".join(changes))
 
@@ -1415,10 +1715,25 @@ class AppController(QObject):
                 # local html unless the plain text actually changed (in
                 # which case the local html is stale and would re-introduce
                 # outdated content).
-                existing.text = rn.text
+                # SAFETY: if remote text is empty but local has content,
+                # treat as a suspicious fetch (decode failure, partial
+                # response, etc.) and skip the body update so we don't
+                # silently destroy the user's data.
+                if (not (rn.text or "").strip()
+                        and (existing.text or "").strip()):
+                    log.warning(
+                        "Note %s: remote text empty but local non-empty "
+                        "(%d chars). Skipping body overwrite.",
+                        rn.id[:8], len(existing.text or ""),
+                    )
+                else:
+                    existing.text = rn.text
+                    if text_changed:
+                        existing.html = ""  # text changed remotely — stale html
+                    # Only adopt remote html when text is non-empty (or both are empty).
+                    if rn.html and rn.text:
+                        existing.html = rn.html
                 existing.title = rn.title
-                if text_changed:
-                    existing.html = ""  # text changed remotely — stale html
                 if color_changed:
                     # User changed colour on the web → drop our local
                     # dark-mode override so we follow the new colour.
@@ -1432,9 +1747,21 @@ class AppController(QObject):
                 # formatting the user just applied.
                 win = self.windows.get(rn.id)
                 visible_changed = (text_changed or title_changed
-                                   or color_changed or list_changed)
-                if win and win.text_edit.hasFocus():
-                    log.info("Skipping refresh for %s (user editing)", rn.id[:8])
+                                   or color_changed or list_changed
+                                   or html_changed)
+                # Treat the user as "actively editing" only if the
+                # window has focus AND they've typed within the last
+                # _edit_idle_seconds. Otherwise refresh through so
+                # remote changes show up in already-open windows.
+                last_edit = self._last_edit_time.get(rn.id, 0.0)
+                idle_for = time.monotonic() - last_edit
+                user_busy = (win and win.text_edit.hasFocus()
+                             and idle_for < self._edit_idle_seconds)
+                if user_busy:
+                    log.info(
+                        "Skipping refresh for %s (user editing, idle %.1fs)",
+                        rn.id[:8], idle_for,
+                    )
                 elif win and visible_changed:
                     log.info("Refreshing window %s", rn.id[:8])
                     self._refresh_window(rn.id)
@@ -1480,17 +1807,25 @@ class AppController(QObject):
         for note_id in list(self._dirty):
             note = self._notes.get(note_id)
             if note:
-                self.sync.push_note(note)
-            self._dirty.discard(note_id)
+                try:
+                    ok = self.sync.push_note(note)
+                except Exception:  # noqa: BLE001
+                    log.exception("push_note crashed for %s", note_id[:8])
+                    ok = False
+                if ok is not False:
+                    self._dirty.discard(note_id)
+            else:
+                self._dirty.discard(note_id)
 
     def _add_window_for_note(self, note: KeepNote):
         if note.id in self.windows:
             return
         win = self._create_window(note)
         self.windows[note.id] = win
-        self._apply_grouping_for_window(note.id, win)
         if self._visibility.get(note.id, True):
             win.show()
+            # show()-then-grouping so the icon attaches first.
+            QTimer.singleShot(0, lambda: self._regroup_window(note.id))
 
     def _refresh_window(self, note_id: str):
         win = self.windows.get(note_id)
@@ -1520,6 +1855,21 @@ class AppController(QObject):
             "KeepDesktop", "Syncing with Google Keep\u2026",
             QSystemTrayIcon.MessageIcon.Information, 2000,
         )
+        # User-triggered Sync Now is also a request to realign with
+        # Keep — drop any locally-imposed order so the manager mirrors
+        # whatever order Keep currently reports (its sortValue field).
+        # Per-note moves the user makes after this will re-establish a
+        # local override via _reorder_note (which now also pushes the
+        # new sortValue back to Keep).
+        cleared = 0
+        for n in self._notes.values():
+            if n.local_order:
+                n.local_order = 0
+                cleared += 1
+        if cleared:
+            log.info("Manual sync: cleared local_order on %d notes", cleared)
+            self._save_notes_to_disk()
+            self._refresh_manager_if_open()
         self._full_sync()
 
     def _periodic_sync(self):
