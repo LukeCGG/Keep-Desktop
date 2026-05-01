@@ -30,11 +30,24 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pytest
           # Sanity check: every release has been broken at least once
           # by a silent pip failure. Verify the critical imports BEFORE
           # the build steps run.
           python -c "import PySide6, gkeepapi, gpsoauth, keyring, requests; print('deps ok')"
+
+      - name: Run test suite
+        shell: pwsh
+        # Tests must pass before we waste time building & publishing a
+        # broken release. Fail the workflow loudly if anything regresses.
+        env:
+          # GitHub runners have no display; use Qt's offscreen platform
+          # so QGuiApplication / QTextDocument can spin up headlessly.
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pytest tests/ -v
 
       - name: Determine version
         id: ver
