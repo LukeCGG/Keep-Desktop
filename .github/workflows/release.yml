@@ -59,6 +59,20 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Building version $v"
 
+      - name: Stamp APP_VERSION into config.py
+        # The Info dialog reads config.APP_VERSION at runtime; without
+        # this step a forgotten manual bump ships an installer whose
+        # filename says 2.1.0 but whose About box says 2.0.0.
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $path = "config.py"
+          $content = Get-Content $path -Raw
+          $new = [regex]::Replace($content, 'APP_VERSION\s*=\s*"[^"]*"', "APP_VERSION = `"$v`"")
+          Set-Content -Path $path -Value $new -NoNewline
+          Write-Host "Stamped APP_VERSION = $v"
+          Select-String -Path $path -Pattern '^APP_VERSION'
+
       - name: Generate icon.ico
         shell: pwsh
         # Use the real Windows Qt platform plugin (not "offscreen") so the
