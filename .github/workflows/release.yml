@@ -47,7 +47,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          python -m pytest archive/tests_archived -v
+          python -m pytest tests/ -v
 
       - name: Determine version
         id: ver
