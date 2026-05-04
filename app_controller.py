@@ -868,6 +868,13 @@ class AppController(QObject):
         self.windows: dict[str, NoteWindow] = {}
         self._notes: dict[str, KeepNote] = {}
         self._dirty: set[str] = set()
+        # Notes the user just deleted locally for which the threaded
+        # `sync.delete_note` trash POST hasn't yet completed. We must
+        # ignore these in `_apply_remote_notes`, otherwise a periodic
+        # sync that races ahead of the trash request will see the note
+        # still untrashed on the server and re-add it locally — which
+        # then reappears in the manager after relaunch.
+        self._pending_deletes: set[str] = set()
         # Per-note timestamp of the last user edit. Used to decide
         # whether a focused note window is "actively being edited" or
         # just sitting open — if it's been idle long enough we let
@@ -1087,6 +1094,15 @@ class AppController(QObject):
             list_items=note.list_items if note.is_list else None,
             dark_mode=note.dark_mode,
         )
+        # If the v2 fetch attached a fresh StyledDoc, render via the
+        # cursor API for faithful empty-line preservation.
+        sdoc = getattr(note, "styled_doc", None)
+        if sdoc is not None and not note.is_list:
+            win._syncing = True
+            try:
+                win.text_edit.set_styled_doc(sdoc)
+            finally:
+                win._syncing = False
         win.note_changed.connect(self._on_note_changed)
         win.note_hidden.connect(self._on_note_hidden)
         win.note_deleted.connect(self._on_note_deleted)
@@ -1139,6 +1155,14 @@ class AppController(QObject):
             note.color_hex = win.color_hex
             note.dark_mode = bool(getattr(win, "dark_mode", False))
             note.html = win.get_html()
+            # Local edit invalidates any cached server-decoded
+            # StyledDoc — drop it so a refresh doesn't overwrite
+            # the user's in-flight typing with stale render.
+            if hasattr(note, "styled_doc"):
+                try:
+                    delattr(note, "styled_doc")
+                except AttributeError:
+                    pass
             # The window may have been toggled in/out of checklist mode
             # by the user; pick that up so it persists.
             note.is_list = bool(getattr(win, "_is_list", False))
@@ -1178,8 +1202,22 @@ class AppController(QObject):
             win.close()
             win.deleteLater()
         if note and self.sync.is_authenticated:
-            threading.Thread(target=self.sync.delete_note, args=(note_id,), daemon=True).start()
+            self._pending_deletes.add(note_id)
+            threading.Thread(
+                target=self._delete_worker, args=(note_id,), daemon=True
+            ).start()
         self._refresh_manager_if_open()
+
+    def _delete_worker(self, note_id: str):
+        try:
+            self.sync.delete_note(note_id)
+        except Exception:  # noqa: BLE001
+            log.exception("delete_note crashed for %s", note_id[:8])
+        finally:
+            # Clear the guard regardless — if the trash POST genuinely
+            # failed the user can re-delete; we don't want to wedge the
+            # note in a never-syncs state.
+            self._pending_deletes.discard(note_id)
 
     def _bring_to_front(self):
         for nid, win in self.windows.items():
@@ -1674,6 +1712,9 @@ class AppController(QObject):
                  len(remote_notes), [d[:8] for d in self._dirty])
         new_remote_ids: list[str] = []
         for rn in remote_notes:
+            if rn.id in self._pending_deletes:
+                # Local delete still in flight — don't resurrect.
+                continue
             existing = self._notes.get(rn.id)
             if existing is None:
                 log.info("New remote note %s title=%r", rn.id[:8], rn.title)
@@ -1749,6 +1790,21 @@ class AppController(QObject):
                 # Only adopt remote html when text is non-empty (or both are empty).
                 if rn.html and rn.text:
                     existing.html = rn.html
+                # Carry the freshly-decoded StyledDoc across so the
+                # cursor renderer (preserves empty paragraphs) is
+                # used on refresh. Without this, _refresh_window
+                # falls back to note.html and HTML round-trip
+                # corrupts blank lines.
+                rn_doc = getattr(rn, "styled_doc", None)
+                if rn_doc is not None:
+                    existing.styled_doc = rn_doc  # type: ignore[attr-defined]
+                elif hasattr(existing, "styled_doc"):
+                    # Remote no longer has a snapshot doc (e.g. legacy
+                    # note); drop the stale one.
+                    try:
+                        delattr(existing, "styled_doc")
+                    except AttributeError:
+                        pass
                 existing.title = rn.title
                 if decision.color_changed:
                     # User changed colour on the web → drop our local
@@ -1834,12 +1890,34 @@ class AppController(QObject):
             win._is_list = note.is_list
             win.set_dark_mode(note.dark_mode)
             if note.is_list and note.list_items:
-                win._set_checklist_html(note.list_items)
+                # Real ChecklistEditor path — reflect remote items.
+                win.set_list_items(note.list_items)
+                win.text_edit.setVisible(False)
+                win.checklist_editor.setVisible(True)
+                win.fmt_toolbar.setVisible(False)
+            elif getattr(note, "styled_doc", None) is not None:
+                # Cursor-based render preserves empty paragraphs and
+                # avoids HTML round-trip artefacts (NBSP injection,
+                # line ping-pong with Keep web).
+                win._syncing = True
+                try:
+                    win.text_edit.set_styled_doc(note.styled_doc)
+                finally:
+                    win._syncing = False
+                win.checklist_editor.setVisible(False)
+                win.text_edit.setVisible(True)
+                win.fmt_toolbar.setVisible(True)
             elif note.html:
                 # Preserve any local rich-text formatting the user has set.
                 win.set_html(note.html)
+                win.checklist_editor.setVisible(False)
+                win.text_edit.setVisible(True)
+                win.fmt_toolbar.setVisible(True)
             else:
                 win.set_text(note.text)
+                win.checklist_editor.setVisible(False)
+                win.text_edit.setVisible(True)
+                win.fmt_toolbar.setVisible(True)
             win.set_title(note.title)
             win._apply_color(note.color_hex)
 

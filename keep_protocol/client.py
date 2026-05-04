@@ -150,6 +150,18 @@ class KeepClient:
         data = self._post(CHANGES_URL, body)
         self.target_version = data.get("toVersion") or self.target_version
 
+        # On a full sync, the server returns the authoritative current
+        # set of nodes. Drop any cached notes that didn't appear in the
+        # response — they've been hard-deleted (purged from Trash).
+        # Without this we'd silently carry forward stale entries.
+        if full:
+            returned_ids = {
+                n.get("id", "") for n in data.get("nodes", [])
+                if n.get("type") in ("NOTE", "LIST")
+            }
+            for stale_id in [nid for nid in self.notes if nid not in returned_ids]:
+                self.notes.pop(stale_id, None)
+
         for n in data.get("nodes", []):
             nid = n.get("id", "")
             ntype = n.get("type", "NOTE")
@@ -175,12 +187,25 @@ class KeepClient:
                     new_sc = n.get("serverChanges") or {}
                     new_snap = (new_sc.get("snapshot") or {})
                     new_rev = new_snap.get("revision")
+                    new_chunks = new_snap.get("serializedChunks")
                     old_sc = existing.raw.get("serverChanges") or {}
                     old_rev = (old_sc.get("snapshot") or {}).get("revision")
                     if new_rev and new_rev != old_rev:
-                        # Server gave us an updated snapshot: trust it
-                        # entirely (don't fall back to old chunks).
-                        merged["serverChanges"] = n["serverChanges"]
+                        # Server gave us an updated snapshot. Trust it
+                        # entirely ONLY if it actually carries chunks —
+                        # an empty/missing chunk list means "revision
+                        # bumped but the snapshot blob wasn't echoed in
+                        # this delta" (Keep does this on metadata-only
+                        # writes). In that case keep the old chunks but
+                        # adopt the new revision so writes use it.
+                        if new_chunks:
+                            merged["serverChanges"] = n["serverChanges"]
+                        else:
+                            merged_sc = dict(old_sc)
+                            merged_snap = dict(merged_sc.get("snapshot") or {})
+                            merged_snap["revision"] = new_rev
+                            merged_sc["snapshot"] = merged_snap
+                            merged["serverChanges"] = merged_sc
                     self.notes[nid] = Note.from_server(merged)
                     # Reset our local revision tracker too — next write
                     # should use the server's current revision, not our
@@ -599,7 +624,29 @@ class KeepClient:
         op_count = len(ops)
         if op_count == 0:
             return {}
-        payload_ops: list = ops if op_count == 1 else [["docs-mlti", ops]]
+        # `sct-add` MUST stay at the top level of serializedCommands —
+        # nesting it inside `docs-mlti` makes the server reject the
+        # whole bundle with 400 Invalid Value (and, for LIST creates,
+        # silently drop the op so the revision counter desyncs).
+        # Mirror Keep web: peel any leading sct-add(s) out of the
+        # docs-mlti wrapper. The outer sct-add(s) also do NOT count
+        # toward clientRevision — only the inner-wrapped ops do.
+        leading_sct_adds: list = []
+        rest = list(ops)
+        while rest and isinstance(rest[0], list) and rest[0] and rest[0][0] == "sct-add":
+            leading_sct_adds.append(rest.pop(0))
+        if not rest:
+            payload_ops = leading_sct_adds
+            inner_count = len(leading_sct_adds)
+        elif len(rest) == 1 and not leading_sct_adds:
+            payload_ops = rest
+            inner_count = 1
+        elif len(rest) == 1 and leading_sct_adds:
+            payload_ops = leading_sct_adds + rest
+            inner_count = 1
+        else:
+            payload_ops = leading_sct_adds + [["docs-mlti", rest]]
+            inner_count = len(rest)
 
         try:
             server_rev = int(note.nested_revision or 0)
@@ -615,7 +662,16 @@ class KeepClient:
         elif note.id not in self._client_revision:
             self._client_revision[note.id] = local_rev
         if note.id not in self._next_request_id:
-            self._next_request_id[note.id] = 1
+            # Keep web uses requestId=0 for the very first commandBundle
+            # ever sent on a node (e.g. when bootstrapping an sct anchor
+            # on a previously-untouched legacy note). Anything else
+            # produces a 400 Invalid Value. Subsequent bundles are 1, 2…
+            first_bundle = (
+                not note.sct_id
+                or not note.nested_revision
+                or server_rev == 0
+            )
+            self._next_request_id[note.id] = 0 if first_bundle else 1
 
         client_revision = self._client_revision[note.id]
         request_id = self._next_request_id[note.id]
@@ -667,7 +723,7 @@ class KeepClient:
             return body
 
         data = self._post(CHANGES_URL_WRITE, body)
-        self._client_revision[note.id] = client_revision + op_count
+        self._client_revision[note.id] = client_revision + inner_count
         self._next_request_id[note.id] = request_id + 1
         self.target_version = data.get("toVersion") or self.target_version
         for n in data.get("nodes", []):
@@ -1113,6 +1169,15 @@ class KeepClient:
         This matches Keep web's "Delete" action — the note is
         recoverable from the Trash for ~7 days before Keep purges it.
         """
+        # Always pull the freshest cached version of the note before
+        # building the trash payload — the caller may be holding an
+        # old `Note` from before a bootstrap/seed write bumped the
+        # server's baseVersion. A stale baseVersion makes the server
+        # silently no-op the trash request (200 OK, no state change),
+        # which is what was leaving feature_test garbage on the account.
+        cached = self.notes.get(note.id)
+        if cached is not None:
+            note = cached
         raw = note.raw or {}
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
         node: dict[str, Any] = {

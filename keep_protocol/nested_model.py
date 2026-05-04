@@ -504,7 +504,11 @@ def to_html(doc: StyledDoc) -> str:
             if r.strikethrough:
                 txt = f"<s>{txt}</s>"
             inner.append(txt)
-        parts.append(f"<{tag}>{''.join(inner) or '&nbsp;'}</{tag}>")
+        # Empty paragraph rendered as bare <p></p>. Qt collapses this in
+        # the visual layout, so callers that need faithful empty-line
+        # preservation should render via the cursor-based path on
+        # NoteTextEdit.set_styled_doc instead.
+        parts.append(f"<{tag}>{''.join(inner)}</{tag}>")
     return "".join(parts)
 
 

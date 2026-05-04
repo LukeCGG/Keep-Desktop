@@ -93,6 +93,16 @@ class Note:
         preview_cmds = ((n.get("previewData") or {}).get("serializedCommands")) or None
         sct_id = _find_sct_id_in_chunks(chunks) or _find_sct_id_in_str(preview_cmds or "")
 
+        # Trash detection: Keep doesn't send a `trashState` field on
+        # most responses — instead a trashed note has its
+        # `timestamps.trashed` set to a real ISO date. The epoch sentinel
+        # "1970-01-01T00:00:00.000Z" (or absent) means "not trashed".
+        # Same idea for deletion (`timestamps.deleted`), but
+        # `deletionState` is also reliably populated, so we keep it.
+        trashed_ts = ts.get("trashed") or ""
+        trashed_via_ts = bool(trashed_ts) and not trashed_ts.startswith("1970")
+        is_trashed = bool(n.get("trashState", 0)) or trashed_via_ts
+
         return cls(
             id=n.get("id", ""),
             server_id=n.get("serverId", ""),
@@ -102,7 +112,7 @@ class Note:
             color=(n.get("color") or "DEFAULT"),
             is_archived=bool(n.get("isArchived", False)),
             is_pinned=bool(n.get("isPinned", False)),
-            is_trashed=bool(n.get("trashState", 0)),
+            is_trashed=is_trashed,
             is_deleted=bool(n.get("deletionState", 0)),
             created=_parse_ts(ts.get("created")),
             updated=_parse_ts(ts.get("updated")),
@@ -121,12 +131,44 @@ class Note:
 
 
 import re as _re
+import json as _json
+# Two known sct-id mint formats in the wild:
+#   - Keep web:  "<nodeIdPrefix>.<16 hex>"     e.g. 19ddc90bde7.1caf008dd29b6956
+#   - This app:  "sct.<16 hex>"                 e.g. sct.a1b2c3d4e5f6a7b8
+# We accept both. The robust path is to parse `sct-add` ops directly,
+# which is the only place a fresh anchor is declared.
 _SCT_RE = _re.compile(r'"(sct\.[a-z0-9]+)"')
 
 
 def _find_sct_id_in_str(s: str) -> Optional[str]:
     if not s:
         return None
+    # Preferred: parse the op stream and pull the id straight out of any
+    # ["sct-add", revision, "<sct_id>", "txt"|"cbx"] op. This catches
+    # Keep-web ids that don't carry a "sct." prefix.
+    try:
+        ops = _json.loads(s)
+    except (ValueError, TypeError):
+        ops = None
+    if isinstance(ops, list):
+        # Top-level can be either a flat op or [["docs-mlti", [ops]]]
+        # or just a list of ops. Walk recursively.
+        stack = [ops]
+        while stack:
+            cur = stack.pop()
+            if not isinstance(cur, list) or not cur:
+                continue
+            head = cur[0]
+            if head == "sct-add" and len(cur) >= 3 and isinstance(cur[2], str):
+                return cur[2]
+            if head == "docs-mlti" and len(cur) >= 2 and isinstance(cur[1], list):
+                stack.extend(cur[1])
+                continue
+            # Otherwise it might be a list of ops — dig into each item.
+            for child in cur:
+                if isinstance(child, list):
+                    stack.append(child)
+    # Fallback to the legacy "sct.<hex>" regex for our own mint format.
     m = _SCT_RE.search(s)
     return m.group(1) if m else None
 

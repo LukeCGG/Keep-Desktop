@@ -106,6 +106,11 @@ class KeepSyncV2:
         # Notes whose cached snapshot decoded to empty despite having
         # indexable_text. We force a full resync next pull to repair.
         self._force_full_resync_for: set[str] = set()
+        # First fetch_notes() call after construction always does a
+        # full resync. Incremental deltas don't reliably echo trash /
+        # archive state changes made on the web side, so we'd carry
+        # stale notes forward across restarts.
+        self._first_fetch_done: bool = False
 
     @property
     def is_authenticated(self) -> bool:
@@ -187,8 +192,14 @@ class KeepSyncV2:
             return []
         with self._lock:
             # Promote to full sync if we previously detected stale
-            # snapshots that need repairing.
-            do_full = force_resync or bool(self._force_full_resync_for)
+            # snapshots that need repairing. Also always full-sync on
+            # the first call after launch so trash/archive changes made
+            # on the web while we were closed get reflected.
+            do_full = (
+                force_resync
+                or not self._first_fetch_done
+                or bool(self._force_full_resync_for)
+            )
             if do_full and self._force_full_resync_for:
                 log.info(
                     "v2 forcing full resync to repair stale notes: %s",
@@ -200,6 +211,7 @@ class KeepSyncV2:
             except KeepError as exc:
                 log.error("v2 sync failed: %s", exc)
                 return []
+            self._first_fetch_done = True
 
         out: list[KeepNote] = []
         for note in self._client.list_notes():
@@ -231,6 +243,7 @@ class KeepSyncV2:
                             "text": cb.text,
                             "checked": cb.checked,
                             "cbx_id": cb.cbx_id,
+                            "indent": cb.indent,
                         })
                 if not items:
                     for li in note.list_items:
@@ -268,22 +281,37 @@ class KeepSyncV2:
                     # indexable_text and drop html so we don't wipe the
                     # user's content.
                     if not plain.strip() and (note.indexable_text or "").strip():
-                        log.warning(
-                            "v2 fetch: decode produced empty doc for %s but "
-                            "indexableText=%r; falling back to plain text "
-                            "(chunks=%d, sct_id=%s, rev=%s)",
-                            note.id[:8], note.indexable_text[:80],
-                            len(note.serialized_chunks or []),
-                            note.sct_id, note.nested_revision,
-                        )
+                        # Distinguish two failure modes:
+                        #  (a) chunks were present but didn't decode —
+                        #      genuinely broken snapshot, force resync.
+                        #  (b) chunks empty (server only sent
+                        #      previewData / indexableText) — normal,
+                        #      no resync needed, no scary warning.
+                        had_chunks = bool(note.serialized_chunks)
+                        if had_chunks:
+                            log.warning(
+                                "v2 fetch: decode produced empty doc for %s but "
+                                "indexableText=%r; falling back to plain text "
+                                "(chunks=%d, sct_id=%s, rev=%s)",
+                                note.id[:8], note.indexable_text[:80],
+                                len(note.serialized_chunks or []),
+                                note.sct_id, note.nested_revision,
+                            )
+                        else:
+                            log.debug(
+                                "v2 fetch: %s has sct_id but no snapshot "
+                                "chunks; using indexableText",
+                                note.id[:8],
+                            )
                         plain = note.indexable_text or note.text
                         html = ""
                         decode_failed = True
-                        # Schedule a full resync next pull so we get a
-                        # fresh snapshot from the server instead of
-                        # repeatedly trying (and failing) to push based
-                        # on broken cached chunks.
-                        self._force_full_resync_for.add(note.id)
+                        if had_chunks:
+                            # Schedule a full resync next pull so we get a
+                            # fresh snapshot from the server instead of
+                            # repeatedly trying (and failing) to push based
+                            # on broken cached chunks.
+                            self._force_full_resync_for.add(note.id)
                 else:
                     plain = note.indexable_text or note.text
                     html = ""
@@ -297,6 +325,12 @@ class KeepSyncV2:
                     trashed=note.is_trashed,
                     sort_key=sort_idx,
                 )
+                # Stash the decoded StyledDoc as a non-dataclass
+                # attribute so note_window can render via the cursor
+                # API (faithful empty-line preservation, no HTML round-
+                # trip artefacts). Falls back to .html if absent.
+                if doc and doc.paragraphs and not decode_failed:
+                    kn.styled_doc = doc  # type: ignore[attr-defined]
                 out.append(kn)
                 # If the cached snapshot was stale (decoder failed but
                 # indexable_text had content), drop the chunks so the
@@ -807,6 +841,23 @@ class KeepSyncV2:
         """
         import difflib
 
+        def _pos_for(local_indent: int, idx: int, prev_pos: tuple[int, ...]) -> tuple[int, ...]:
+            """Build a tree position tuple for an item given its indent
+            level and the position of the previous (outer) row.
+
+            Top-level rows get `(idx,)`. Indented rows get
+            `(parent_idx, child_idx)` — keeping the encoder happy when
+            it emits multi-element cbx-mv positions.
+            """
+            if local_indent <= 0 or not prev_pos:
+                return (idx,)
+            # Trim/extend prev_pos so its length == indent, then append a
+            # fresh trailing index. We can't know the true child index
+            # locally without walking server state — use the running
+            # local position counter under the parent.
+            base = prev_pos[: max(1, local_indent)]
+            return tuple(base) + (idx,)
+
         out: list[CheckboxItem] = []
         # Fast-path: the UI already tagged each row with an id.
         if all(isinstance(r, dict) and r.get("cbx_id") for r in local_rows):
@@ -815,7 +866,8 @@ class KeepSyncV2:
                     cbx_id=str(r["cbx_id"]),
                     text=str(r.get("text", "")),
                     checked=bool(r.get("checked")),
-                    position=(i,),
+                    position=(i,) if not int(r.get("indent", 0) or 0)
+                             else (max(0, i - 1), i),
                 ))
             return out
 
@@ -838,11 +890,13 @@ class KeepSyncV2:
             # If the local row also carries an explicit cbx_id, prefer it.
             if isinstance(r, dict) and r.get("cbx_id"):
                 cbx_id = str(r["cbx_id"])
+            indent = int(r.get("indent", 0) or 0) if isinstance(r, dict) else 0
+            position = (i,) if indent <= 0 else (max(0, i - 1), i)
             out.append(CheckboxItem(
                 cbx_id=cbx_id,
                 text=str(r.get("text", "")),
                 checked=bool(r.get("checked")),
-                position=(i,),
+                position=position,
             ))
         return out
 
@@ -858,9 +912,11 @@ class KeepSyncV2:
                         "text": str(it.get("text", "")),
                         "checked": bool(it.get("checked")),
                         "cbx_id": str(it.get("cbx_id", "")) or None,
+                        "indent": int(it.get("indent", 0) or 0),
                     })
                 else:
-                    out.append({"text": str(it), "checked": False, "cbx_id": None})
+                    out.append({"text": str(it), "checked": False,
+                                "cbx_id": None, "indent": 0})
             return out
 
         out: list[dict] = []

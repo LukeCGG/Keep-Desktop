@@ -1,15 +1,16 @@
 """Individual sticky-note window widget."""
 
-from PySide6.QtCore import Qt, Signal, QPoint, QSize, QEvent
+from PySide6.QtCore import Qt, Signal, QPoint, QSize, QEvent, QPropertyAnimation, QEasingCurve, QRect, QTimer
 from PySide6.QtGui import (
     QFont, QColor, QCursor, QPainter, QPen,
     QTextCharFormat, QTextBlockFormat, QTextCursor, QAction,
-    QSyntaxHighlighter,
+    QSyntaxHighlighter, QPainterPath, QBrush,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel, QLineEdit,
     QPushButton, QMenu, QSizeGrip, QGraphicsDropShadowEffect,
-    QGridLayout, QToolButton,
+    QGridLayout, QToolButton, QCheckBox, QScrollArea, QFrame,
+    QStyleOptionButton, QStyle, QApplication,
 )
 
 from config import (
@@ -409,6 +410,11 @@ class TitleBar(QWidget):
 
         self.title_edit = QLineEdit(title)
         self.title_edit.setPlaceholderText("Title")
+        # Show the START of the title when it overflows the available
+        # width — default QLineEdit places the cursor at the end after
+        # construction, which scrolls the view so the user only sees
+        # the tail of long titles.
+        self.title_edit.setCursorPosition(0)
         self.title_edit.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.title_edit.setStyleSheet(
             "QLineEdit { color: #222; background: transparent; border: none;"
@@ -597,9 +603,102 @@ class NoteTextEdit(QTextEdit):
         # and <h2> by default. Keep web does NOT — headings there are
         # only larger, not bold (unless the user actually toggles bold).
         # Override the default style sheet so our rendering matches.
+        # Also flatten paragraph margins to 0 so plain newlines render
+        # as single line breaks (matching Keep web's editor view) — Qt
+        # otherwise inserts a full paragraph gap between every <p>.
         self.document().setDefaultStyleSheet(
-            "h1, h2, h3, h4, h5, h6 { font-weight: normal; }"
+            "h1, h2, h3, h4, h5, h6 { font-weight: normal; margin: 0; }"
+            "p { margin: 0; padding: 0; }"
+            "ul, ol { margin: 0; padding: 0; }"
+            "li { margin: 0; }"
         )
+        # Same for the underlying default block format (plain-text
+        # paragraphs created without an explicit format).
+        from PySide6.QtGui import QTextBlockFormat
+        _bf = QTextBlockFormat()
+        _bf.setTopMargin(0)
+        _bf.setBottomMargin(0)
+        _bf.setLineHeight(115.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cur = self.textCursor()
+        cur.select(cur.SelectionType.Document)
+        cur.mergeBlockFormat(_bf)
+
+    def _apply_tight_block_format(self):
+        """Re-apply zero-margin block formatting to every paragraph in
+        the document. Needed after setHtml/setPlainText because Qt
+        re-creates the blocks with their default (non-tight) format."""
+        from PySide6.QtGui import QTextBlockFormat
+        bf = QTextBlockFormat()
+        bf.setTopMargin(0)
+        bf.setBottomMargin(0)
+        bf.setLineHeight(115.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        try:
+            cur.select(cur.SelectionType.Document)
+            cur.mergeBlockFormat(bf)
+        finally:
+            cur.endEditBlock()
+
+    def setPlainText(self, text):  # type: ignore[override]
+        super().setPlainText(text)
+        self._apply_tight_block_format()
+
+    def setHtml(self, html):  # type: ignore[override]
+        super().setHtml(html)
+        self._apply_tight_block_format()
+
+    def set_styled_doc(self, doc):
+        """Render a `keep_protocol.nested_model.StyledDoc` faithfully
+        using the cursor API. Unlike setHtml, this preserves *exact*
+        paragraph counts including empty paragraphs — Qt's HTML parser
+        otherwise collapses empty `<p></p>` blocks, and `<p><br/></p>`
+        produces an extra newline. The cursor approach round-trips
+        cleanly through `toPlainText()` so push diffs aren't tainted
+        by HTML-rendering artefacts (the cause of the blank-line
+        ping-pong with Keep web)."""
+        from PySide6.QtGui import QTextCharFormat, QTextBlockFormat, QFont
+        self.clear()
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        try:
+            base_block = QTextBlockFormat()
+            base_block.setTopMargin(0)
+            base_block.setBottomMargin(0)
+            base_block.setLineHeight(
+                115.0,
+                QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+            )
+            # Apply to the document's first (already-existing) block.
+            cur.setBlockFormat(base_block)
+            for i, para in enumerate(doc.paragraphs):
+                if i > 0:
+                    cur.insertBlock(base_block)
+                # Heading sizing (no bold — Keep web matches this).
+                bf = QTextBlockFormat(base_block)
+                heading_size = None
+                if para.heading == 1:
+                    heading_size = 18
+                elif para.heading == 2:
+                    heading_size = 14
+                cur.setBlockFormat(bf)
+                for run in para.runs:
+                    if not run.text:
+                        continue
+                    cf = QTextCharFormat()
+                    if heading_size is not None:
+                        cf.setFontPointSize(heading_size)
+                    if run.bold:
+                        cf.setFontWeight(QFont.Weight.Bold)
+                    if run.italic:
+                        cf.setFontItalic(True)
+                    if run.underline:
+                        cf.setFontUnderline(True)
+                    if run.strikethrough:
+                        cf.setFontStrikeOut(True)
+                    cur.insertText(run.text, cf)
+        finally:
+            cur.endEditBlock()
         self.setStyleSheet("""
             QTextEdit {
                 border: none;
@@ -891,6 +990,457 @@ class ResizeGrip(QWidget):
             win.save_geometry()
 
 
+# ── Checklist editor (real per-item rows) ─────────────────────────────
+
+
+_INDENT_PX = 22  # pixels per indent level
+
+
+class _DragGripLabel(QLabel):
+    """6-dot drag handle shown on the left of each checklist row.
+
+    Mouse press starts a row-drag in the parent ``ChecklistEditor``;
+    move events are forwarded so the editor can run the animation.
+    """
+
+    def __init__(self, row: "ChecklistRow"):
+        super().__init__(row)
+        self._row = row
+        self.setFixedSize(14, 22)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag to reorder")
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(0, 0, 0, 90)))
+        for col in (4, 9):
+            for row in (4, 11, 18):
+                p.drawEllipse(col, row, 2, 2)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            editor = self._row.editor()
+            if editor is not None:
+                editor.begin_drag(self._row, ev.globalPosition().toPoint())
+
+    def mouseMoveEvent(self, ev):
+        editor = self._row.editor()
+        if editor is not None:
+            editor.update_drag(ev.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, _ev):
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        editor = self._row.editor()
+        if editor is not None:
+            editor.end_drag()
+
+
+class _RowLineEdit(QLineEdit):
+    """Single-line text input that bubbles up Enter / Backspace / Tab
+    so the parent ``ChecklistEditor`` can grow / shrink / indent."""
+
+    enter_pressed = Signal()
+    backspace_at_start = Signal()
+    tab_pressed = Signal(bool)  # True = shift held → outdent
+
+    def event(self, ev):
+        # Qt swallows Tab/Shift-Tab in QLineEdit before keyPressEvent
+        # ever runs (it's used for focus chain navigation). We need to
+        # intercept at `event()` to claim them as indent/outdent.
+        if ev.type() == QEvent.Type.KeyPress:
+            key = ev.key()
+            if key == Qt.Key.Key_Tab:
+                self.tab_pressed.emit(False)
+                return True
+            if key == Qt.Key.Key_Backtab:
+                self.tab_pressed.emit(True)
+                return True
+        return super().event(ev)
+
+    def keyPressEvent(self, ev):
+        key = ev.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.enter_pressed.emit()
+            return
+        if key == Qt.Key.Key_Backspace and self.cursorPosition() == 0 and not self.hasSelectedText():
+            self.backspace_at_start.emit()
+            return
+        super().keyPressEvent(ev)
+
+
+class ChecklistRow(QFrame):
+    """A single checkbox row inside :class:`ChecklistEditor`.
+
+    Holds the data triple ``(text, checked, indent)`` plus optional
+    server-side ``cbx_id`` so that diff-based pushes preserve identity
+    across edits.
+    """
+
+    def __init__(self, text: str = "", checked: bool = False,
+                 indent: int = 0, cbx_id: str = "",
+                 editor: "ChecklistEditor | None" = None):
+        super().__init__(editor)
+        self._editor_ref = editor
+        self._indent = max(0, int(indent))
+        self.cbx_id = cbx_id or ""
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("background: transparent;")
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 1, 0, 1)
+        row.setSpacing(4)
+
+        self.grip = _DragGripLabel(self)
+        row.addWidget(self.grip)
+
+        self.indent_spacer = QWidget(self)
+        self.indent_spacer.setFixedWidth(self._indent * _INDENT_PX)
+        row.addWidget(self.indent_spacer)
+
+        self.checkbox = QCheckBox(self)
+        self.checkbox.setChecked(bool(checked))
+        # Custom indicator styling: an empty checkbox is otherwise
+        # invisible against the note's coloured background. Use a
+        # subtle white fill + dark border so both states are obvious.
+        self.checkbox.setStyleSheet(
+            "QCheckBox { background: transparent; }"
+            "QCheckBox::indicator {"
+            "    width: 16px; height: 16px;"
+            "    border: 1.5px solid rgba(0,0,0,0.55);"
+            "    border-radius: 3px;"
+            "    background: rgba(255,255,255,0.85);"
+            "}"
+            "QCheckBox::indicator:hover {"
+            "    border-color: rgba(0,0,0,0.85);"
+            "    background: rgba(255,255,255,1.0);"
+            "}"
+            "QCheckBox::indicator:checked {"
+            "    background: rgba(0,0,0,0.78);"
+            "    border-color: rgba(0,0,0,0.78);"
+            "    image: none;"
+            "}"
+        )
+        self.checkbox.toggled.connect(self._on_checked)
+        row.addWidget(self.checkbox)
+
+        self.line = _RowLineEdit(self)
+        self.line.setText(text or "")
+        self.line.setFrame(False)
+        self.line.setStyleSheet(
+            "QLineEdit { background: transparent; border: none; padding: 2px; }"
+        )
+        self.line.setFont(QFont("Segoe UI", 10))
+        self.line.textEdited.connect(self._on_text_edited)
+        self.line.enter_pressed.connect(self._on_enter)
+        self.line.backspace_at_start.connect(self._on_backspace_at_start)
+        self.line.tab_pressed.connect(self._on_tab)
+        row.addWidget(self.line, stretch=1)
+
+        self._apply_checked_style(checked)
+
+    # -- editor backref --------------------------------------------------
+    def editor(self) -> "ChecklistEditor | None":
+        return self._editor_ref
+
+    def set_editor(self, editor: "ChecklistEditor"):
+        self._editor_ref = editor
+        self.setParent(editor)
+
+    # -- indent ----------------------------------------------------------
+    @property
+    def indent(self) -> int:
+        return self._indent
+
+    def set_indent(self, level: int):
+        level = max(0, min(int(level), 4))
+        if level == self._indent:
+            return
+        self._indent = level
+        self.indent_spacer.setFixedWidth(level * _INDENT_PX)
+        editor = self.editor()
+        if editor is not None:
+            editor._on_changed()
+
+    # -- text/check ------------------------------------------------------
+    def text(self) -> str:
+        return self.line.text()
+
+    def is_checked(self) -> bool:
+        return self.checkbox.isChecked()
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.line.text(),
+            "checked": self.checkbox.isChecked(),
+            "indent": self._indent,
+            "cbx_id": self.cbx_id,
+        }
+
+    # -- internal slots --------------------------------------------------
+    def _on_checked(self, checked: bool):
+        self._apply_checked_style(checked)
+        editor = self.editor()
+        if editor is not None:
+            editor._on_row_checked(self, checked)
+            editor._on_changed()
+
+    def _on_text_edited(self, _t):
+        editor = self.editor()
+        if editor is not None:
+            editor._on_changed()
+
+    def _on_enter(self):
+        editor = self.editor()
+        if editor is not None:
+            editor.insert_row_after(self)
+
+    def _on_backspace_at_start(self):
+        editor = self.editor()
+        if editor is not None:
+            editor.merge_into_previous(self)
+
+    def _on_tab(self, shift: bool):
+        if shift:
+            self.set_indent(self._indent - 1)
+        else:
+            self.set_indent(self._indent + 1)
+
+    def _apply_checked_style(self, checked: bool):
+        if checked:
+            self.line.setStyleSheet(
+                "QLineEdit { background: transparent; border: none;"
+                "            padding: 2px; color: #888;"
+                "            text-decoration: line-through; }"
+            )
+        else:
+            self.line.setStyleSheet(
+                "QLineEdit { background: transparent; border: none;"
+                "            padding: 2px; color: #222; }"
+            )
+
+
+class ChecklistEditor(QScrollArea):
+    """Scrollable list of :class:`ChecklistRow` with drag-reorder + indent.
+
+    Drop-in replacement for the old QTextEdit-based glyph checklist.
+    Emits ``changed`` whenever any row's text/check/indent/order changes.
+    """
+
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { width: 6px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: rgba(0,0,0,0.18);"
+            "    border-radius: 3px; min-height: 30px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            "    height: 0; }"
+        )
+        self._host = QWidget()
+        self._host.setStyleSheet("background: transparent;")
+        self._vbox = QVBoxLayout(self._host)
+        self._vbox.setContentsMargins(8, 8, 8, 8)
+        self._vbox.setSpacing(2)
+        self._vbox.addStretch(1)
+        self.setWidget(self._host)
+
+        self._rows: list[ChecklistRow] = []
+        self._suppress_changed: bool = False
+        # Drag-reorder state
+        self._dragging_row: ChecklistRow | None = None
+        self._drag_start_global: QPoint | None = None
+        self._drag_anim: QPropertyAnimation | None = None
+
+    # ── public API ────────────────────────────────────────────────────
+    def set_items(self, items: list[dict]):
+        """Replace all rows. ``items`` is a list of dicts with keys
+        ``text``, ``checked`` and optionally ``indent`` and ``cbx_id``."""
+        self._suppress_changed = True
+        try:
+            for r in self._rows:
+                r.setParent(None)
+                r.deleteLater()
+            self._rows.clear()
+            for it in items or []:
+                row = ChecklistRow(
+                    text=it.get("text", ""),
+                    checked=bool(it.get("checked", False)),
+                    indent=int(it.get("indent", 0) or 0),
+                    cbx_id=it.get("cbx_id", "") or "",
+                    editor=self,
+                )
+                self._rows.append(row)
+                self._vbox.insertWidget(self._vbox.count() - 1, row)
+            if not self._rows:
+                # Always show at least one empty row so the user has
+                # somewhere to type — matches Keep web's empty-list view.
+                self._add_blank_row()
+        finally:
+            self._suppress_changed = False
+
+    def get_items(self) -> list[dict]:
+        return [r.to_dict() for r in self._rows]
+
+    def focus_first_empty(self):
+        for r in self._rows:
+            if not r.text():
+                r.line.setFocus()
+                return
+        if self._rows:
+            self._rows[-1].line.setFocus()
+
+    # ── row management ────────────────────────────────────────────────
+    def _add_blank_row(self):
+        row = ChecklistRow(editor=self)
+        self._rows.append(row)
+        self._vbox.insertWidget(self._vbox.count() - 1, row)
+
+    def insert_row_after(self, src: ChecklistRow):
+        try:
+            idx = self._rows.index(src)
+        except ValueError:
+            idx = len(self._rows) - 1
+        new_row = ChecklistRow(indent=src.indent, editor=self)
+        self._rows.insert(idx + 1, new_row)
+        self._vbox.insertWidget(idx + 1, new_row)
+        new_row.line.setFocus()
+        self._on_changed()
+
+    def merge_into_previous(self, src: ChecklistRow):
+        """Backspace-at-start: merge this row's text into the previous
+        row and delete this row. This is the only way to remove a row —
+        there is no per-item delete button."""
+        try:
+            idx = self._rows.index(src)
+        except ValueError:
+            return
+        if idx == 0:
+            # First row: just outdent if possible, otherwise no-op.
+            if src.indent > 0:
+                src.set_indent(src.indent - 1)
+            return
+        prev = self._rows[idx - 1]
+        carried = src.text()
+        joined = prev.text() + carried
+        # Place cursor at the join point on the previous row.
+        cursor_pos = len(prev.text())
+        prev.line.setText(joined)
+        prev.line.setFocus()
+        prev.line.setCursorPosition(cursor_pos)
+        # Remove src
+        self._rows.pop(idx)
+        src.setParent(None)
+        src.deleteLater()
+        self._on_changed()
+
+    # ── drag-reorder ──────────────────────────────────────────────────
+    def begin_drag(self, row: ChecklistRow, global_pos: QPoint):
+        self._dragging_row = row
+        self._drag_start_global = global_pos
+        row.raise_()
+
+    def update_drag(self, global_pos: QPoint):
+        row = self._dragging_row
+        if row is None or self._drag_start_global is None:
+            return
+        delta_y = global_pos.y() - self._drag_start_global.y()
+        if abs(delta_y) < row.height() // 2:
+            return
+        # Decide direction
+        try:
+            idx = self._rows.index(row)
+        except ValueError:
+            return
+        if delta_y > 0 and idx < len(self._rows) - 1:
+            self._swap_rows(idx, idx + 1)
+            self._drag_start_global = global_pos
+        elif delta_y < 0 and idx > 0:
+            self._swap_rows(idx, idx - 1)
+            self._drag_start_global = global_pos
+
+    def end_drag(self):
+        self._dragging_row = None
+        self._drag_start_global = None
+
+    def _on_row_checked(self, row: "ChecklistRow", checked: bool):
+        """Auto-sort: when a row is checked it sinks to the bottom of
+        the list (below any other unchecked rows). When unchecked, it
+        rises to just above the first checked row. Mirrors Keep web's
+        behaviour and keeps active todos visually grouped at the top."""
+        try:
+            cur_idx = self._rows.index(row)
+        except ValueError:
+            return
+        if checked:
+            # Move to the very end.
+            target_idx = len(self._rows) - 1
+        else:
+            # Move to just above the first checked row (or end if none).
+            first_checked = next(
+                (i for i, r in enumerate(self._rows)
+                 if r is not row and r.is_checked()),
+                len(self._rows),
+            )
+            target_idx = max(0, first_checked - (1 if cur_idx < first_checked else 0))
+        if target_idx == cur_idx:
+            return
+        start_geom = QRect(row.geometry())
+        self._rows.pop(cur_idx)
+        self._rows.insert(target_idx, row)
+        self._vbox.removeWidget(row)
+        self._vbox.insertWidget(target_idx, row)
+        QTimer.singleShot(0, lambda: self._animate_into_place(row, start_geom))
+
+    def _swap_rows(self, i: int, j: int):
+        if i == j:
+            return
+        # Animate the displaced row sliding into place.
+        moving_to_top = j < i
+        target = self._rows[j]
+        start_geom = QRect(target.geometry())
+        # Reorder data + layout.
+        self._rows[i], self._rows[j] = self._rows[j], self._rows[i]
+        # Take both rows out of the layout, then re-insert in the new
+        # order. Layout indices: rows occupy 0..n-1 (the trailing
+        # stretch lives at index n).
+        a = self._rows[min(i, j)]
+        b = self._rows[max(i, j)]
+        self._vbox.removeWidget(a)
+        self._vbox.removeWidget(b)
+        self._vbox.insertWidget(min(i, j), a)
+        self._vbox.insertWidget(max(i, j), b)
+        # Animate
+        QTimer.singleShot(0, lambda: self._animate_into_place(target, start_geom))
+        self._on_changed()
+
+    def _animate_into_place(self, row: ChecklistRow, from_rect: QRect):
+        end_rect = QRect(row.geometry())
+        if from_rect == end_rect:
+            return
+        if self._drag_anim is not None:
+            self._drag_anim.stop()
+        anim = QPropertyAnimation(row, b"geometry", self)
+        anim.setDuration(140)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(from_rect)
+        anim.setEndValue(end_rect)
+        anim.start()
+        self._drag_anim = anim
+
+    # ── change broadcast ──────────────────────────────────────────────
+    def _on_changed(self):
+        if not self._suppress_changed:
+            self.changed.emit()
+
+
 class NoteWindow(QWidget):
     """A single floating sticky note window."""
 
@@ -957,17 +1507,30 @@ class NoteWindow(QWidget):
 
         # Text body
         self.text_edit = NoteTextEdit(self)
-        if list_items:
-            self._set_checklist_html(list_items)
-        elif html:
+        if html and not list_items:
             self.text_edit.setHtml(html)
         else:
             self.text_edit.setPlainText(text)
         inner.addWidget(self.text_edit, stretch=1)
 
+        # Real per-item checklist editor (used when ``_is_list`` is True).
+        # Stays hidden when the note is plain-text mode.
+        self.checklist_editor = ChecklistEditor(self)
+        self.checklist_editor.setVisible(False)
+        self.checklist_editor.changed.connect(self._on_checklist_changed)
+        inner.addWidget(self.checklist_editor, stretch=1)
+        if list_items:
+            self._syncing = True
+            self.checklist_editor.set_items(list_items)
+            self._syncing = False
+            self.text_edit.setVisible(False)
+            self.checklist_editor.setVisible(True)
+
         # Formatting toolbar
         self.fmt_toolbar = FormattingToolbar(self.text_edit, color_hex, self)
         inner.addWidget(self.fmt_toolbar)
+        if list_items:
+            self.fmt_toolbar.setVisible(False)
 
         # Connect text changed AFTER setting initial content
         self.text_edit.textChanged.connect(self._on_text_changed)
@@ -1096,8 +1659,19 @@ class NoteWindow(QWidget):
         if not self._syncing:
             self.note_changed.emit(self.note_id)
 
+    def _on_checklist_changed(self):
+        self._update_char_count()
+        if not (self.title_bar.title_edit.text() or "").strip():
+            self._update_window_title("")
+        if not self._syncing:
+            self.note_changed.emit(self.note_id)
+
     def _update_char_count(self):
-        count = len(self.text_edit.toPlainText())
+        if self._is_list and self.checklist_editor.isVisible():
+            count = sum(len(it.get("text", ""))
+                        for it in self.checklist_editor.get_items())
+        else:
+            count = len(self.text_edit.toPlainText())
         self.char_count.setText(f"{count} chars")
 
     def _on_close(self):
@@ -1138,24 +1712,34 @@ class NoteWindow(QWidget):
     def _toggle_checklist_mode(self):
         """Convert the note between plain text and checklist mode."""
         if self._is_list:
-            # Checklist -> plain text: strip the checkbox prefixes.
+            # Checklist -> plain text: collapse rows to plain text.
             lines = []
-            for line in self.text_edit.toPlainText().splitlines():
-                stripped = line.lstrip("\u2611\u2610 ").rstrip()
-                lines.append(stripped)
+            for it in self.checklist_editor.get_items():
+                t = (it.get("text") or "").strip()
+                if t:
+                    lines.append(t)
             self._is_list = False
             self._syncing = True
             self.text_edit.setPlainText("\n".join(lines))
             self._syncing = False
+            self.checklist_editor.setVisible(False)
+            self.text_edit.setVisible(True)
+            self.fmt_toolbar.setVisible(True)
         else:
             # Plain text -> checklist: each non-empty line becomes an item.
             raw = self.text_edit.toPlainText()
             lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
             if not lines:
                 lines = [""]
-            items = [{"text": ln, "checked": False} for ln in lines]
+            items = [{"text": ln, "checked": False, "indent": 0,
+                      "cbx_id": ""} for ln in lines]
             self._is_list = True
-            self._set_checklist_html(items)
+            self._syncing = True
+            self.checklist_editor.set_items(items)
+            self._syncing = False
+            self.text_edit.setVisible(False)
+            self.checklist_editor.setVisible(True)
+            self.fmt_toolbar.setVisible(False)
         self.note_changed.emit(self.note_id)
 
     @property
@@ -1172,7 +1756,14 @@ class NoteWindow(QWidget):
         return self.title_bar.title_label.text()
 
     def get_list_items(self):
-        """Parse checkbox items from the text content. Returns list of {text, checked}."""
+        """Return the current checklist items.
+
+        When the window is in checklist mode this delegates to the
+        live :class:`ChecklistEditor`. Otherwise we fall back to a
+        glyph-based parse of the plain text (for older notes that
+        haven't been re-rendered yet)."""
+        if self._is_list and self.checklist_editor.isVisible():
+            return self.checklist_editor.get_items()
         items = []
         for line in self.text_edit.toPlainText().splitlines():
             line = line.strip()
@@ -1189,6 +1780,16 @@ class NoteWindow(QWidget):
             else:
                 items.append({"text": line, "checked": False})
         return items
+
+    def set_list_items(self, items: list[dict]):
+        """Refresh the checklist editor with new items (used when remote
+        sync brings in new content). Caller is responsible for ensuring
+        the window is in list mode."""
+        self._syncing = True
+        try:
+            self.checklist_editor.set_items(items)
+        finally:
+            self._syncing = False
 
     def _set_checklist_html(self, list_items):
         """Render checkbox list items as HTML with checkbox characters.
@@ -1227,6 +1828,10 @@ class NoteWindow(QWidget):
         # Preserve cursor if user has it focused.
         if self.title_bar.title_edit.text() != title:
             self.title_bar.title_edit.setText(title)
+            # Re-anchor the view to the start so a long title shows its
+            # beginning when the field isn't focused.
+            if not self.title_bar.title_edit.hasFocus():
+                self.title_bar.title_edit.setCursorPosition(0)
         self._syncing = False
         self._update_window_title(title)
 
