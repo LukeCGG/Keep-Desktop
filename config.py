@@ -2,11 +2,12 @@
 
 import json
 import os
+import subprocess
 import sys
 import winreg
 
 APP_NAME = "KeepDesktop"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.0"
 # GitHub repository (owner/name) used for the auto-updater.
 GITHUB_REPO = "LukeCGG/Keep-Desktop"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,19 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TOKEN_FILE = os.path.join(DATA_DIR, "keep_token.dat")
 POSITIONS_FILE = os.path.join(DATA_DIR, "positions.json")
 NOTES_FILE = os.path.join(DATA_DIR, "notes.json")
+
+# Path of the Startup-folder shortcut that controls "start with Windows".
+# This MUST be the same path the Inno Setup installer creates (see
+# installer.iss → [Icons] {userstartup}\KeepDesktop.lnk) so the in-app
+# toggle and the installer checkbox are literally the same setting.
+STARTUP_FOLDER = os.path.join(
+    os.environ.get("APPDATA", APP_DIR),
+    "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+)
+STARTUP_SHORTCUT = os.path.join(STARTUP_FOLDER, f"{APP_NAME}.lnk")
+# Legacy registry path used by older versions (<= 2.0.2) — we still read
+# it for migration but the canonical store is the .lnk above.
+_LEGACY_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 # Google Keep note colors mapped to hex (keys match gkeepapi ColorValue names)
 KEEP_COLORS = {
@@ -131,23 +145,103 @@ def remove_position(note_id):
     save_positions(positions)
 
 
-def set_autostart(enabled):
-    """Add or remove KeepDesktop from Windows startup registry."""
-    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+def _autostart_target() -> tuple[str, str, str]:
+    """Return (target_exe, arguments, working_dir) for the Startup
+    shortcut. Differs between frozen builds and source runs."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, "", os.path.dirname(sys.executable)
+    # Running from source — prefer pythonw.exe so we don't get a
+    # console window flash on every login.
+    py = sys.executable
+    pyw = py.replace("python.exe", "pythonw.exe")
+    if os.path.exists(pyw):
+        py = pyw
+    main_py = os.path.join(APP_DIR, "main.py")
+    return py, f'"{main_py}"', APP_DIR
+
+
+def _remove_legacy_run_key() -> None:
+    """Strip the old HKCU Run-key entry written by versions <= 2.0.2.
+
+    Keeping it around would cause double-launch when both the legacy
+    key AND the new Startup-folder shortcut are present.
+    """
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-        if enabled:
-            exe = sys.executable
-            script = os.path.join(APP_DIR, "main.py")
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}" "{script}"')
-        else:
-            try:
-                winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _LEGACY_RUN_KEY, 0, winreg.KEY_SET_VALUE,
+        )
+        try:
+            winreg.DeleteValue(key, APP_NAME)
+        except FileNotFoundError:
+            pass
+        finally:
+            winreg.CloseKey(key)
     except OSError:
         pass
+
+
+def is_autostart_enabled() -> bool:
+    """True iff a Startup-folder shortcut for KeepDesktop exists.
+
+    This is the SOURCE OF TRUTH — both the installer's tickbox and the
+    in-app "Start with Windows" toggle write to the same .lnk path.
+    """
+    return os.path.isfile(STARTUP_SHORTCUT)
+
+
+def set_autostart(enabled: bool) -> bool:
+    """Add or remove the Startup-folder shortcut.
+
+    Uses PowerShell's WScript.Shell COM helper (no extra deps). Returns
+    True on success. Idempotent.
+    """
+    if not enabled:
+        try:
+            os.remove(STARTUP_SHORTCUT)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        _remove_legacy_run_key()
+        return True
+
+    target, args, workdir = _autostart_target()
+    try:
+        os.makedirs(STARTUP_FOLDER, exist_ok=True)
+    except OSError:
+        return False
+
+    # Build the PowerShell snippet. Single-quoted string literals are
+    # safest because backslashes don't need escaping; only embedded
+    # single quotes do (we double them per PS rules).
+    def _ps_quote(s: str) -> str:
+        return "'" + s.replace("'", "''") + "'"
+
+    ps = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        f"$lnk = $ws.CreateShortcut({_ps_quote(STARTUP_SHORTCUT)}); "
+        f"$lnk.TargetPath = {_ps_quote(target)}; "
+        f"$lnk.Arguments = {_ps_quote(args)}; "
+        f"$lnk.WorkingDirectory = {_ps_quote(workdir)}; "
+        "$lnk.WindowStyle = 1; "
+        "$lnk.Save()"
+    )
+    CREATE_NO_WINDOW = 0x08000000
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", ps],
+            creationflags=CREATE_NO_WINDOW,
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return False
+
+    _remove_legacy_run_key()
+    return os.path.isfile(STARTUP_SHORTCUT)
 
 
 def save_token(token):

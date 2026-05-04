@@ -779,14 +779,23 @@ def encode_list_diff(
 
     ops: list = []
 
-    # 1. Removals — anything in old but not referenced by new.
+    # 1. Removals — anything in old but not referenced by new. Emit
+    # cbx-rm in DESCENDING position order so each rm doesn't shift
+    # the indices used by later rms.
+    removed_ids: set[str] = set()
+    rm_targets: list[tuple[tuple[int, ...], str]] = []
     for cbx_id, old_it in old_by_id.items():
         if cbx_id not in new_by_id:
-            ops.append([
-                "cbx-rm", list_sct_id, cbx_id, list(old_it.position) or [0], 0,
-            ])
+            rm_targets.append((tuple(old_it.position) or (0,), cbx_id))
+            removed_ids.add(cbx_id)
+    rm_targets.sort(key=lambda t: t[0], reverse=True)
+    for pos, cbx_id in rm_targets:
+        ops.append([
+            "cbx-rm", list_sct_id, cbx_id, list(pos), 0,
+        ])
 
-    # 2. In-place edits for matched items.
+    # 2. In-place text/check edits for matched items (no position
+    # changes yet — those are computed below in a single pass).
     for cbx_id, new_it in new_by_id.items():
         old_it = old_by_id[cbx_id]
 
@@ -820,13 +829,46 @@ def encode_list_diff(
                 ["cb:ck", bool(new_it.checked)],
             ])
 
-        # --- reorder / re-indent ---
-        if tuple(old_it.position) != tuple(new_it.position):
+    # 2b. Reorder pass — cbx-mv ops apply sequentially. Compute the
+    # current order of surviving items (post-removals, pre-moves) and
+    # the target order, then emit moves that incrementally transform
+    # the former into the latter. Each cbx-mv shifts the positions of
+    # everything between the source and the destination, so we walk
+    # left-to-right and only move whichever item is in the wrong
+    # cell at index `i`. Top-level rows only — nested indents fall
+    # back to absolute-position emission below.
+    surviving_old = sorted(
+        (old_by_id[cid] for cid in old_by_id if cid not in removed_ids),
+        key=lambda it: tuple(it.position),
+    )
+    target_order = [it for it in new_items if it.cbx_id in new_by_id]
+    cur_ids = [it.cbx_id for it in surviving_old]
+    tgt_ids = [it.cbx_id for it in target_order]
+    only_top_level = (
+        all(len(tuple(it.position)) <= 1 for it in surviving_old)
+        and all(len(tuple(it.position)) <= 1 for it in target_order)
+    )
+    if only_top_level and set(cur_ids) == set(tgt_ids):
+        for i in range(len(tgt_ids)):
+            if cur_ids[i] == tgt_ids[i]:
+                continue
+            j = cur_ids.index(tgt_ids[i], i)
             ops.append([
-                "cbx-mv", list_sct_id,
-                list(old_it.position),
-                list(new_it.position),
+                "cbx-mv", list_sct_id, [j], [i],
             ])
+            cur_ids.insert(i, cur_ids.pop(j))
+    else:
+        # Indented or mismatched-set fallback: emit absolute-position
+        # cbx-mv per matched item whose position changed. May produce
+        # redundant ops but keeps backwards-compatible behaviour.
+        for cbx_id, new_it in new_by_id.items():
+            old_it = old_by_id[cbx_id]
+            if tuple(old_it.position) != tuple(new_it.position):
+                ops.append([
+                    "cbx-mv", list_sct_id,
+                    list(old_it.position),
+                    list(new_it.position),
+                ])
 
     # 3. Fresh additions.
     for it in fresh_items:

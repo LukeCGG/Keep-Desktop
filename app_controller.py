@@ -18,7 +18,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile
 
 from config import (
-    load_config, save_config, set_autostart, save_token,
+    load_config, save_config, set_autostart, is_autostart_enabled, save_token,
     SYNC_INTERVAL_MS, DATA_DIR, load_token,
     load_json, save_json, APP_NAME, APP_VERSION, GITHUB_REPO,
 )
@@ -838,6 +838,19 @@ class AppController(QObject):
     def __init__(self):
         super().__init__()
         self.config = load_config()
+        # Reconcile the autostart flag with reality. The Inno Setup
+        # installer creates a Startup-folder shortcut directly without
+        # touching our config, so a fresh install would otherwise show
+        # the in-app toggle as OFF even though Windows IS configured to
+        # launch us at login. Source of truth is the .lnk on disk.
+        real_autostart = is_autostart_enabled()
+        if self.config.get("autostart", False) != real_autostart:
+            log.info(
+                "autostart: reconciling config (%s) with disk state (%s)",
+                self.config.get("autostart", False), real_autostart,
+            )
+            self.config["autostart"] = real_autostart
+            save_config(self.config)
         # Pick sync backend. v2 (keep_protocol) supports docs-nestedModel
         # formatting and won't corrupt Keep web's state. v1 (gkeepapi)
         # is kept as a fallback for one release; see config.py.
@@ -964,7 +977,10 @@ class AppController(QObject):
 
         autostart_action = QAction("Start with Windows", menu)
         autostart_action.setCheckable(True)
-        autostart_action.setChecked(self.config.get("autostart", False))
+        # Read the live disk state so the menu always reflects whether
+        # the Startup-folder shortcut actually exists, even if the
+        # installer or another app touched it behind our back.
+        autostart_action.setChecked(is_autostart_enabled())
         autostart_action.toggled.connect(self._toggle_autostart)
         menu.addAction(autostart_action)
 
@@ -1864,9 +1880,14 @@ class AppController(QObject):
     # ── Settings ───────────────────────────────────────────────────────
 
     def _toggle_autostart(self, enabled):
-        self.config["autostart"] = enabled
+        ok = set_autostart(enabled)
+        if not ok:
+            log.warning("set_autostart(%s) failed", enabled)
+        # Re-read the actual on-disk state so config.json never lies
+        # about what Windows will do at login.
+        actual = is_autostart_enabled()
+        self.config["autostart"] = actual
         save_config(self.config)
-        set_autostart(enabled)
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:

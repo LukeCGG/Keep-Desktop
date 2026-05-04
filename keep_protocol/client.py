@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from typing import Any, Optional
@@ -55,6 +56,9 @@ class KeepError(RuntimeError):
     pass
 
 
+log = logging.getLogger(__name__)
+
+
 class KeepClient:
     """Talks to Keep's HTTP API. Single-account, single-thread. Holds the
     short-lived bearer and re-mints it on demand (~1h TTL)."""
@@ -75,9 +79,13 @@ class KeepClient:
         # Loaded lazily from server state on first write.
         self._client_revision: dict[str, int] = {}
         self._next_request_id: dict[str, int] = {}
+        # When create_note bootstraps a LIST, it pre-mints the first
+        # cbx-add inline. The follow-up seeder reuses that id for
+        # item[0] so we don't end up with a duplicate row.
+        self._pending_first_cbx: dict[str, str] = {}
         # Numeric session id used inside commandBundles (Keep web uses a
         # 19-digit int, distinct from clientSessionId).
-        self._bundle_session_id = str(secrets.randbelow(10**19))
+        self._bundle_session_id = str(secrets.randbelow(2**63 - 1))
 
     # -------------------------------------------------------------- internal
 
@@ -297,6 +305,7 @@ class KeepClient:
             "title": new_title if new_title is not None else (raw.get("title", note.title) or ""),
             "isArchived": bool(raw.get("isArchived", note.is_archived)),
             "isPinned": bool(raw.get("isPinned", note.is_pinned)),
+            "color": raw.get("color") or note.color or "DEFAULT",
             "nodeSettings": dict(raw.get("nodeSettings") or {"graveyardState": "EXPANDED"}),
             "tasks": list(raw.get("tasks") or []),
             "clientChanges": {
@@ -372,12 +381,18 @@ class KeepClient:
         *,
         new_title: Optional[str] = None,
         dry_run: bool = False,
+        existing_ids_override: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Wipe the note's checkboxes and recreate from `new_items`.
 
         Mirrors `update_note_doc` for LIST nodes. Requires the LIST to
         already have a `cbx`-type sct (i.e. has been touched by Keep
         web). Bootstrapping a brand-new list isn't supported here.
+
+        ``existing_ids_override`` lets the caller declare the cbx ids
+        currently on the server when our local cache hasn't yet caught
+        up (e.g. right after a LIST bootstrap). When supplied, the
+        decoded snapshot is ignored.
         """
         if note.type != "LIST":
             raise KeepError(f"note {note.id!r} is not a LIST")
@@ -387,10 +402,13 @@ class KeepClient:
                 f"checkboxes yet (would need sct-add bootstrap)"
             )
 
-        existing, _ = decode_checkboxes(
-            note.serialized_chunks or [], note.sct_id
-        )
-        existing_ids = [item.cbx_id for item in existing]
+        if existing_ids_override is not None:
+            existing_ids = list(existing_ids_override)
+        else:
+            existing, _ = decode_checkboxes(
+                note.serialized_chunks or [], note.sct_id
+            )
+            existing_ids = [item.cbx_id for item in existing]
         ops = encode_replace_list(note.sct_id, existing_ids, new_items)
         if not ops:
             # Nothing on either side — no-op.
@@ -408,10 +426,14 @@ class KeepClient:
         except (TypeError, ValueError):
             server_rev = 0
         local_rev = self._client_revision.get(note.id, 0)
-        if server_rev > local_rev:
+        # Trust the server's revision when it knows about this node — our
+        # local count can drift if the server silently dropped ops in a
+        # bundle (e.g. nested sct-add). Use the higher of the two only
+        # when we've never heard back from the server.
+        if server_rev > 0:
             self._client_revision[note.id] = server_rev
         elif note.id not in self._client_revision:
-            self._client_revision[note.id] = server_rev
+            self._client_revision[note.id] = local_rev
         if note.id not in self._next_request_id:
             self._next_request_id[note.id] = 1
 
@@ -434,6 +456,7 @@ class KeepClient:
             "title": new_title if new_title is not None else (raw.get("title", note.title) or ""),
             "isArchived": bool(raw.get("isArchived", note.is_archived)),
             "isPinned": bool(raw.get("isPinned", note.is_pinned)),
+            "color": raw.get("color") or note.color or "DEFAULT",
             "nodeSettings": dict(raw.get("nodeSettings") or {"graveyardState": "EXPANDED"}),
             "tasks": list(raw.get("tasks") or []),
             "clientChanges": {
@@ -583,10 +606,14 @@ class KeepClient:
         except (TypeError, ValueError):
             server_rev = 0
         local_rev = self._client_revision.get(note.id, 0)
-        if server_rev > local_rev:
+        # Trust the server's revision when it knows about this node — our
+        # local count can drift if the server silently dropped ops in a
+        # bundle (e.g. nested sct-add). Use the local count only when the
+        # server hasn't echoed a nested_revision yet.
+        if server_rev > 0:
             self._client_revision[note.id] = server_rev
         elif note.id not in self._client_revision:
-            self._client_revision[note.id] = server_rev
+            self._client_revision[note.id] = local_rev
         if note.id not in self._next_request_id:
             self._next_request_id[note.id] = 1
 
@@ -803,8 +830,67 @@ class KeepClient:
                 if ("serverChanges" not in n
                         and existing.raw.get("serverChanges")):
                     merged["serverChanges"] = existing.raw["serverChanges"]
+                # Server frequently strips `text`/`indexableText` from
+                # the response. Echo the value we just sent so the
+                # in-memory cache reflects what's now on the server.
+                if nid == note.id:
+                    if not (merged.get("text") or "").strip() and new_text:
+                        merged["text"] = new_text
+                    if (not (merged.get("indexableText") or "").strip()
+                            and new_text):
+                        merged["indexableText"] = new_text
                 self.notes[nid] = Note.from_server(merged)
         return data
+
+    # ------------------------------------------------------------ sct bootstrap
+
+    def bootstrap_sct(
+        self,
+        note: Note,
+        initial_text: str,
+        *,
+        new_title: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Mint a docs-nestedModel sct anchor for a note that has none,
+        and seed it with ``initial_text``.
+
+        This is the same shape Keep web sends on the very first edit of
+        a fresh note. Without it, multi-line ``text`` pushed via the
+        legacy field gets server-side auto-promoted into a LIST (one
+        line per item) — silently destroying user formatting.
+
+        After this call returns, ``note.sct_id`` is populated and
+        subsequent edits should route through ``update_text_diff`` /
+        ``update_note_doc``.
+
+        Op shape (verified against captured Keep-web traffic)::
+
+            ["sct-add", 0, "sct.<rand>", "txt"]
+            ["docs-nestedModel", ["text", 1, sct], {"ty":"is","ibi":1,"s":text}]
+        """
+        if note.type != "NOTE":
+            raise KeepError(
+                f"bootstrap_sct: note {note.id!r} is type {note.type}, "
+                f"not NOTE"
+            )
+        if note.sct_id:
+            # Already bootstrapped — nothing to do.
+            return {}
+        sct_id = f"sct.{secrets.token_hex(8)}"
+        ops: list = [["sct-add", 0, sct_id, "txt"]]
+        if initial_text:
+            ops.append([
+                "docs-nestedModel",
+                ["text", 1, sct_id],
+                {"ty": "is", "ibi": 1, "s": initial_text},
+            ])
+        # Pre-seed the note's sct_id locally so the post-helper's
+        # bookkeeping (and any cache merge afterwards) sees the right
+        # anchor. The server will echo it back in serializedChunks.
+        note.sct_id = sct_id
+        return self._post_node_with_ops(
+            note, ops, new_title=new_title, dry_run=False,
+        )
 
     # ------------------------------------------------------------ create / trash
 
@@ -813,14 +899,18 @@ class KeepClient:
         title: str = "",
         text: str = "",
         color: str = "DEFAULT",
+        node_type: str = "NOTE",
+        list_items: Optional[list[dict]] = None,
     ) -> Note:
-        """Create a new NOTE on Keep and return the parsed Note.
+        """Create a new NOTE or LIST on Keep and return the parsed Note.
 
-        Sends a single node with kind=notes#node, type=NOTE, parentId=root,
-        plus a fresh client-generated id. Body lives in the legacy ``text``
-        field; Keep will create the docs-nestedModel anchor (sct_id) the
-        first time the note is opened in the web UI.
+        Sends a single node with kind=notes#node, the requested ``type``,
+        parentId=root, plus a fresh client-generated id. NOTE bodies
+        live in the legacy ``text`` field; LIST bodies are seeded via
+        ``list_items`` (each ``{text, checked}``).
         """
+        if node_type not in ("NOTE", "LIST"):
+            raise ValueError(f"create_note: unsupported type {node_type!r}")
         # Keep ids look like "1789aabbccdd.eeffgghhiijjkkll" — 12 hex
         # chars from the client clock + 16 hex chars of randomness, dot
         # separated. Web uses the same shape.
@@ -834,7 +924,7 @@ class KeepClient:
             "id": node_id,
             "kind": "notes#node",
             "parentId": "root",
-            "type": "NOTE",
+            "type": node_type,
             "timestamps": {
                 "kind": "notes#timestamps",
                 "created": now_iso,
@@ -848,15 +938,88 @@ class KeepClient:
             "sortValue": sort_value,
             "baseVersion": "0",
             "title": title or "",
-            "text": text or "",
             "isArchived": False,
             "isPinned": False,
             "color": color or "DEFAULT",
             "nodeSettings": {"graveyardState": "EXPANDED"},
         }
+        # NOTE bodies use docs-nestedModel state from the very first
+        # write — Keep web posts an `sct-add` op at clientRevision=0
+        # bundled into the create node. Without it, the server defaults
+        # the new node to LIST. We mirror that exactly.
+        # LIST creation uses the same trick: mint a txt sct, replace
+        # it with a cbx sct via `sct-rp`, then `cbx-add` per item plus
+        # per-character `is` ops to seed the text. Keep web sends this
+        # as type=NOTE; the server promotes the node to LIST when it
+        # sees the cbx state.
+        extra_nodes: list[dict[str, Any]] = []
+        sct_id_minted: Optional[str] = None
+        if node_type == "NOTE":
+            sct_id_minted = f"sct.{secrets.token_hex(8)}"
+            seed_text = text or ""
+            ops: list = [["sct-add", 0, sct_id_minted, "txt"]]
+            if seed_text:
+                ops.append([
+                    "docs-nestedModel",
+                    ["text", 1, sct_id_minted],
+                    {"ty": "is", "ibi": 1, "s": seed_text},
+                ])
+            payload_ops = ops if len(ops) == 1 else [["docs-mlti", ops]]
+            node["clientChanges"] = {
+                "clientRevision": "0",
+                "commandBundles": [{
+                    "sessionId": self._bundle_session_id,
+                    "requestId": "0",
+                    "serializedCommands": _serialize_ops(payload_ops),
+                }],
+            }
+            # Initialise our local revision/request bookkeeping for
+            # this note. After the create, the server is at revision
+            # = len(ops); next request_id is 1.
+            self._client_revision[node_id] = len(ops)
+            self._next_request_id[node_id] = 1
+        else:  # LIST
+            # Send as type=NOTE; cbx ops promote it to LIST server-side.
+            # Mirror Keep web's exact bootstrap shape: sct-add OUTSIDE
+            # docs-mlti, then docs-mlti wrapping sct-rp + the first
+            # cbx-add. Without the cbx-add the server only commits 1 op
+            # (it silently drops sct-add when nested in docs-mlti) and
+            # later writes go out-of-sync. Items beyond the first are
+            # written via a follow-up replace_list_items call.
+            node["type"] = "NOTE"
+            txt_sct = f"sct.{secrets.token_hex(8)}"
+            cbx_sct = f"sct.{secrets.token_hex(8)}"
+            sct_id_minted = cbx_sct
+            first_cbx_id = f"cbx.{secrets.token_hex(6)}"
+            payload_ops: list = [
+                ["sct-add", 0, txt_sct, "txt"],
+                ["docs-mlti", [
+                    ["sct-rp", 0, txt_sct, "cbx", cbx_sct],
+                    ["cbx-add", cbx_sct, first_cbx_id, [0]],
+                ]],
+            ]
+            node["clientChanges"] = {
+                "clientRevision": "0",
+                "commandBundles": [{
+                    "sessionId": self._bundle_session_id,
+                    "requestId": "0",
+                    "serializedCommands": _serialize_ops(payload_ops),
+                }],
+            }
+            # Server commits the docs-mlti's 2 inner ops (sct-rp +
+            # cbx-add). The outer sct-add appears not to count toward
+            # the nested revision counter — empirically the next POST
+            # must use clientRevision=2 to be accepted.
+            self._client_revision[node_id] = 2
+            self._next_request_id[node_id] = 1
+            # Stash the first cbx_id so the follow-up seeder can reuse it
+            # for item[0] instead of minting a duplicate row.
+            self._pending_first_cbx[node_id] = first_cbx_id
+            # Items beyond the first are seeded after the create lands —
+            # see code path below that dispatches `replace_list_items`.
         body = {
             "clientTimestamp": now_iso,
-            "nodes": [node],
+            "nodes": [node] + extra_nodes,
             "requestHeader": self._request_header(),
         }
         if self.target_version:
@@ -866,13 +1029,81 @@ class KeepClient:
         # Pull the canonical version of the new note from the response
         # if the server echoed it back; otherwise build one from what
         # we sent so callers get something sensible immediately.
+        echoed: Optional[dict[str, Any]] = None
         for n in data.get("nodes", []):
             if n.get("id") == node_id:
-                created = Note.from_server(n)
-                self.notes[node_id] = created
-                return created
-        created = Note.from_server(node)
+                echoed = n
+                break
+        canonical = echoed or node
+        # Server often strips `text` and `indexableText` from the create
+        # response since the body lives in docs-nestedModel state for
+        # any note that gets opened in web. Echo our sent text into
+        # both fields so the in-memory cache doesn't lie about content
+        # until the next full sync.
+        if node_type == "NOTE" and text:
+            canonical = dict(canonical)
+            if not (canonical.get("text") or "").strip():
+                canonical["text"] = text
+            if not (canonical.get("indexableText") or "").strip():
+                canonical["indexableText"] = text
+        created = Note.from_server(canonical)
         self.notes[node_id] = created
+        # Cache the LIST_ITEM children too so list_notes can find them
+        # (gkeepapi-style legacy items). Keep web's response usually
+        # includes them already, but be defensive.
+        if extra_nodes:
+            for child in extra_nodes:
+                cid = child["id"]
+                if cid not in self.notes:
+                    self.notes[cid] = Note.from_server(child)
+        # For LIST creates, the bootstrap above only set up the cbx
+        # sct anchor — items still need to be added. Sync once to pick
+        # up the server's freshly promoted LIST type, then write the
+        # items via a single full-replace.
+        if node_type == "LIST" and list_items:
+            try:
+                self.sync()
+            except KeepError as exc:
+                log.warning("create_note: post-bootstrap sync failed: %s", exc)
+            # Re-grab the canonical note from the cache.
+            promoted = self.notes.get(node_id)
+            if promoted is None or promoted.type != "LIST":
+                log.warning(
+                    "create_note: bootstrap didn't promote %s to LIST "
+                    "(cached type=%s); items not seeded",
+                    node_id, getattr(promoted, "type", "?"),
+                )
+                return created
+            # The sync may not have refreshed serialized_chunks yet
+            # (server's read endpoint can lag the write). We minted
+            # the cbx sct ourselves, so plug it in if Note.from_server
+            # couldn't recover it from chunks.
+            if not promoted.sct_id and sct_id_minted:
+                promoted.sct_id = sct_id_minted
+            cbx_items = [
+                CheckboxItem(
+                    cbx_id="",  # always mint fresh; the bootstrap row
+                                # is wiped via existing_ids_override
+                    text=str(it.get("text", "") or ""),
+                    checked=bool(it.get("checked", False)),
+                    position=(i,),
+                )
+                for i, it in enumerate(list_items)
+            ]
+            # The bootstrap pre-minted one cbx-add. Tell replace_list_items
+            # to wipe it so we don't try to re-add a row that already
+            # exists server-side (which 400s with "Invalid Value").
+            bootstrap_cbx = self._pending_first_cbx.pop(node_id, "")
+            existing_override = [bootstrap_cbx] if bootstrap_cbx else []
+            try:
+                self.replace_list_items(
+                    promoted, cbx_items,
+                    existing_ids_override=existing_override,
+                )
+            except KeepError as exc:
+                log.warning("create_note: list-item seed failed: %s", exc)
+            else:
+                created = self.notes.get(node_id, created)
         return created
 
     def trash_note(self, note: Note) -> dict[str, Any]:

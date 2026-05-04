@@ -436,6 +436,16 @@ class KeepSyncV2:
             # has no separate colour-only endpoint; colour rides along
             # with the next body write.
             wire_color = _hex_to_wire_color(keep_note.color_hex)
+            # Capture the pre-mutation colour so the metadata follow-up
+            # below (after update_text_diff) can detect a colour-only
+            # edit. Without this, mirroring overwrites server.color and
+            # the follow-up always thinks the colour is unchanged.
+            original_server_color = (
+                (server.raw or {}).get("color") or server.color
+            )
+            original_server_title = (
+                (server.raw or {}).get("title") or server.title or ""
+            )
             if wire_color and wire_color != server.color:
                 server.color = wire_color
                 if isinstance(server.raw, dict):
@@ -480,6 +490,31 @@ class KeepSyncV2:
                         keep_note.id[:8], server_text_len,
                     )
                     return False
+                # Multi-line text via the legacy `text` field makes
+                # the Keep server auto-promote NOTE → LIST (one item
+                # per \n) — silently shredding content. Bootstrap a
+                # docs-nestedModel sct anchor first; the same shape
+                # Keep web sends on the very first edit.
+                local_text = keep_note.text or ""
+                if "\n" in local_text:
+                    log.info(
+                        "v2 push: note %s has no sct_id and multi-line "
+                        "text; bootstrapping sct anchor",
+                        keep_note.id[:8],
+                    )
+                    try:
+                        self._client.bootstrap_sct(
+                            server, local_text,
+                            new_title=keep_note.title,
+                        )
+                    except KeepError as exc:
+                        log.error(
+                            "sct bootstrap failed for %s: %s",
+                            keep_note.id, exc,
+                        )
+                        return False
+                    self._base_text[keep_note.id] = local_text
+                    return True
                 log.info(
                     "v2 push: note %s has no sct_id; using legacy text "
                     "fallback (formatting will not be preserved)",
@@ -642,6 +677,29 @@ class KeepSyncV2:
                 # Schedule full resync so next attempt has fresh state.
                 self._force_full_resync_for.add(keep_note.id)
                 return False
+
+            # If the body was unchanged, update_text_diff sent no ops
+            # and never pushed our title/colour edits. Issue a metadata
+            # push to cover the title-only / colour-only edit cases.
+            # (Keep web has no body-less title-update via clientChanges
+            # — it sends a plain node payload instead, which is what
+            # update_note_metadata does.)
+            try:
+                wire_color = _hex_to_wire_color(keep_note.color_hex)
+                title_changed = (keep_note.title or "") != original_server_title
+                color_changed = (wire_color and wire_color != original_server_color)
+                if title_changed or color_changed:
+                    self._client.update_note_metadata(
+                        server,
+                        new_title=(keep_note.title or "")
+                                   if title_changed else None,
+                        new_color=wire_color if color_changed else None,
+                    )
+            except KeepError as exc:
+                log.warning(
+                    "v2 push: metadata follow-up failed for %s: %s",
+                    keep_note.id[:8], exc,
+                )
 
             # Refresh cache entry + base text from what we just wrote.
             # Force a full sync so the server's authoritative post-write
@@ -819,8 +877,17 @@ class KeepSyncV2:
             out.append({"text": line, "checked": checked, "cbx_id": None})
         return out
 
-    def create_note(self, title="", text="", color_hex="#FFF475") -> Optional[KeepNote]:
-        """Create a new note via /changes and return a KeepNote mirror."""
+    def create_note(self, title="", text="", color_hex="#FFF475",
+                    is_list: bool = False,
+                    list_items: Optional[list[dict]] = None) -> Optional[KeepNote]:
+        """Create a new note via /changes and return a KeepNote mirror.
+
+        Pass ``is_list=True`` (and optionally pre-populated ``list_items``,
+        each ``{"text": str, "checked": bool}``) to create a checklist
+        directly. Without this the new note is created as a plain NOTE
+        and converting NOTE→LIST later requires a separate flow Keep
+        web doesn't expose to clients — so we don't try.
+        """
         if not self._authenticated or not self._client:
             log.warning("v2 create_note: not authenticated")
             return None
@@ -830,21 +897,27 @@ class KeepSyncV2:
                     title=title or "",
                     text=text or "",
                     color=_hex_to_wire_color(color_hex),
+                    node_type=("LIST" if is_list else "NOTE"),
+                    list_items=(list_items if is_list else None),
                 )
             except KeepError as exc:
                 log.error("v2 create_note failed: %s", exc)
                 return None
             self._server_notes[created.id] = created
             self._base_text[created.id] = text or ""
-            log.info("v2 create_note ok: %s", created.id[:12])
-            return KeepNote(
+            log.info("v2 create_note ok: %s (type=%s)",
+                     created.id[:12], created.type)
+            kn = KeepNote(
                 id=created.id,
                 title=created.title,
                 text=text or "",
                 color_hex=color_hex,
                 pinned=created.is_pinned,
                 sort_key=int(created.sort_value or 0),
+                is_list=is_list,
+                list_items=(list(list_items or []) if is_list else []),
             )
+            return kn
 
     def delete_note(self, note_id: str):
         """Trash a note via /changes (matches Keep web's Delete action)."""
