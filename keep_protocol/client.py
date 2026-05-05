@@ -134,101 +134,155 @@ class KeepClient:
     # ------------------------------------------------------------------ sync
 
     def sync(self, full: bool = False) -> dict[str, Any]:
-        """Pull changes from the server. Returns the raw response.
-        Updates `self.notes` and `self.target_version`.
+        """Pull changes from the server. Returns the raw response of
+        the LAST page (the one that closed out the loop). Updates
+        ``self.notes`` and ``self.target_version``.
 
-        full=True forces a full resync (ignores any prior cursor).
+        Keep's ``/changes`` endpoint is paginated via the
+        ``"truncated"`` flag: when it's ``True`` the response only
+        carries part of the available change set, and the next call
+        — using the response's ``toVersion`` as the cursor — picks up
+        where the previous one left off. Looping is required for both
+        the initial full sync (a busy account easily exceeds one
+        page's worth of nodes) and incremental deltas (long-idle
+        clients can have several pages of catch-up). Without the loop
+        the cache is silently incomplete; the controller's "stale
+        ID" purge then deletes every note that didn't make it into
+        the first page, only for them to "reappear" once the next
+        sync cycle walks the remaining pages.
+
+        ``full=True`` ignores any prior cursor and asks for the
+        complete state. The cache-purge sweep that drops cached notes
+        not echoed by the server runs once at the END of the loop —
+        not after each page — so partial pages don't trigger
+        spurious deletions.
         """
-        body = {
-            "clientTimestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "nodes": [],
-            "requestHeader": self._request_header(),
-        }
-        if not full and self.target_version:
-            body["targetVersion"] = self.target_version
+        ids_seen_this_sync: set[str] = set()
+        forced_resync = False
+        last_data: dict[str, Any] = {}
 
-        data = self._post(CHANGES_URL, body)
-        self.target_version = data.get("toVersion") or self.target_version
-
-        # On a full sync, the server returns the authoritative current
-        # set of nodes. Drop any cached notes that didn't appear in the
-        # response — they've been hard-deleted (purged from Trash).
-        # Without this we'd silently carry forward stale entries.
-        if full:
-            returned_ids = {
-                n.get("id", "") for n in data.get("nodes", [])
-                if n.get("type") in ("NOTE", "LIST")
+        first_page = True
+        while True:
+            body = {
+                "clientTimestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                "nodes": [],
+                "requestHeader": self._request_header(),
             }
-            for stale_id in [nid for nid in self.notes if nid not in returned_ids]:
+            # First page of a full sync: send no targetVersion so the
+            # server resends everything. Subsequent pages — and every
+            # page of an incremental sync — use the cursor returned by
+            # the previous page (or our existing one for incremental).
+            send_cursor = (not first_page) or (not full)
+            if send_cursor and self.target_version:
+                body["targetVersion"] = self.target_version
+
+            data = self._post(CHANGES_URL, body)
+            last_data = data
+
+            if data.get("forceFullResync"):
+                # Server says our cursor is too stale or otherwise
+                # invalid. Restart the loop in full mode from a clean
+                # slate; the next iteration will send no cursor.
+                self.target_version = None
+                ids_seen_this_sync.clear()
+                forced_resync = True
+                full = True
+                first_page = True
+                continue
+
+            self.target_version = data.get("toVersion") or self.target_version
+
+            for n in data.get("nodes", []):
+                nid = n.get("id", "")
+                ntype = n.get("type", "NOTE")
+                if ntype in ("NOTE", "LIST"):
+                    if nid:
+                        ids_seen_this_sync.add(nid)
+                    # Server only echoes CHANGED fields in incremental
+                    # syncs. If we have an existing cached version,
+                    # merge the delta into its raw payload so unchanged
+                    # fields like serializedChunks / indexableText /
+                    # sct_id survive.
+                    existing = self.notes.get(nid)
+                    if existing is not None and existing.raw:
+                        merged = dict(existing.raw)
+                        merged.update(n)
+                        # serverChanges is itself a dict that needs
+                        # deep merge so we don't blow away the snapshot
+                        # just because the delta omits it.
+                        if ("serverChanges" not in n
+                                and existing.raw.get("serverChanges")):
+                            merged["serverChanges"] = existing.raw["serverChanges"]
+                        # If the delta brings a new serverChanges with
+                        # a different revision than what we cached,
+                        # the cached serializedChunks are stale by
+                        # definition. Drop them so the decoder doesn't
+                        # run on outdated ops.
+                        new_sc = n.get("serverChanges") or {}
+                        new_snap = (new_sc.get("snapshot") or {})
+                        new_rev = new_snap.get("revision")
+                        new_chunks = new_snap.get("serializedChunks")
+                        old_sc = existing.raw.get("serverChanges") or {}
+                        old_rev = (old_sc.get("snapshot") or {}).get("revision")
+                        if new_rev and new_rev != old_rev:
+                            # Server gave us an updated snapshot. Trust
+                            # it entirely ONLY if it actually carries
+                            # chunks — an empty/missing chunk list
+                            # means "revision bumped but the snapshot
+                            # blob wasn't echoed in this delta" (Keep
+                            # does this on metadata-only writes). In
+                            # that case keep the old chunks but adopt
+                            # the new revision so writes use it.
+                            if new_chunks:
+                                merged["serverChanges"] = n["serverChanges"]
+                            else:
+                                merged_sc = dict(old_sc)
+                                merged_snap = dict(merged_sc.get("snapshot") or {})
+                                merged_snap["revision"] = new_rev
+                                merged_sc["snapshot"] = merged_snap
+                                merged["serverChanges"] = merged_sc
+                        self.notes[nid] = Note.from_server(merged)
+                        # Reset our local revision tracker too — next
+                        # write should use the server's current
+                        # revision, not our post-last-write counter
+                        # (which is now stale).
+                        if new_rev:
+                            try:
+                                self._client_revision[nid] = int(new_rev)
+                            except (TypeError, ValueError):
+                                pass
+                    else:
+                        self.notes[nid] = Note.from_server(n)
+                elif ntype == "LIST_ITEM":
+                    parent = self.notes.get(n.get("parentId", ""))
+                    if parent and parent.type == "LIST":
+                        # Best-effort; full list-item modelling can
+                        # come later.
+                        parent.list_items.append(__import__('keep_protocol.models', fromlist=['ListItem']).ListItem(
+                            id=n.get("id", ""),
+                            text=n.get("text", "") or "",
+                            checked=bool(n.get("checked", False)),
+                            sort_value=int(n.get("sortValue", 0)),
+                            parent_id=n.get("superListItemId"),
+                        ))
+
+            first_page = False
+            if not data.get("truncated"):
+                break
+
+        # On a full sync, after we've seen EVERY page, drop any
+        # cached notes that didn't appear in the union of pages —
+        # those have been hard-deleted server-side (purged from
+        # Trash). Doing this per-page would clobber legitimate notes
+        # that sit on a later page.
+        if full:
+            for stale_id in [nid for nid in self.notes if nid not in ids_seen_this_sync]:
                 self.notes.pop(stale_id, None)
 
-        for n in data.get("nodes", []):
-            nid = n.get("id", "")
-            ntype = n.get("type", "NOTE")
-            if ntype in ("NOTE", "LIST"):
-                # Server only echoes CHANGED fields in incremental syncs.
-                # If we have an existing cached version, merge the delta
-                # into its raw payload so unchanged fields like
-                # serializedChunks / indexableText / sct_id survive.
-                existing = self.notes.get(nid)
-                if existing is not None and existing.raw:
-                    merged = dict(existing.raw)
-                    merged.update(n)
-                    # serverChanges is itself a dict that needs deep merge
-                    # so we don't blow away the snapshot just because the
-                    # delta omits it.
-                    if ("serverChanges" not in n
-                            and existing.raw.get("serverChanges")):
-                        merged["serverChanges"] = existing.raw["serverChanges"]
-                    # If the delta brings a new serverChanges with a
-                    # different revision than what we cached, the cached
-                    # serializedChunks are stale by definition. Drop
-                    # them so the decoder doesn't run on outdated ops.
-                    new_sc = n.get("serverChanges") or {}
-                    new_snap = (new_sc.get("snapshot") or {})
-                    new_rev = new_snap.get("revision")
-                    new_chunks = new_snap.get("serializedChunks")
-                    old_sc = existing.raw.get("serverChanges") or {}
-                    old_rev = (old_sc.get("snapshot") or {}).get("revision")
-                    if new_rev and new_rev != old_rev:
-                        # Server gave us an updated snapshot. Trust it
-                        # entirely ONLY if it actually carries chunks —
-                        # an empty/missing chunk list means "revision
-                        # bumped but the snapshot blob wasn't echoed in
-                        # this delta" (Keep does this on metadata-only
-                        # writes). In that case keep the old chunks but
-                        # adopt the new revision so writes use it.
-                        if new_chunks:
-                            merged["serverChanges"] = n["serverChanges"]
-                        else:
-                            merged_sc = dict(old_sc)
-                            merged_snap = dict(merged_sc.get("snapshot") or {})
-                            merged_snap["revision"] = new_rev
-                            merged_sc["snapshot"] = merged_snap
-                            merged["serverChanges"] = merged_sc
-                    self.notes[nid] = Note.from_server(merged)
-                    # Reset our local revision tracker too — next write
-                    # should use the server's current revision, not our
-                    # post-last-write counter (which is now stale).
-                    if new_rev:
-                        try:
-                            self._client_revision[nid] = int(new_rev)
-                        except (TypeError, ValueError):
-                            pass
-                else:
-                    self.notes[nid] = Note.from_server(n)
-            elif ntype == "LIST_ITEM":
-                parent = self.notes.get(n.get("parentId", ""))
-                if parent and parent.type == "LIST":
-                    # Best-effort; full list-item modelling can come later.
-                    parent.list_items.append(__import__('keep_protocol.models', fromlist=['ListItem']).ListItem(
-                        id=n.get("id", ""),
-                        text=n.get("text", "") or "",
-                        checked=bool(n.get("checked", False)),
-                        sort_value=int(n.get("sortValue", 0)),
-                        parent_id=n.get("superListItemId"),
-                    ))
-        return data
+        if forced_resync:
+            log.info("v2 sync: server requested forceFullResync; rebuilt cache")
+
+        return last_data
 
     def list_notes(self, include_archived: bool = False, include_trashed: bool = False) -> list[Note]:
         """Return cached notes. Calls sync() if cache is empty."""

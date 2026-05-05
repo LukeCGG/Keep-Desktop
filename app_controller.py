@@ -237,6 +237,61 @@ def _escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# Step granularity for new sort values — matches Keep web's typical
+# spacing. Big enough that the midpoint between two adjacent values
+# always has room for further inserts without collision.
+_REORDER_STEP = 1 << 22  # ~4M
+
+
+def _compute_new_sort_value(ordered: list, note) -> int:
+    """Pick a new ``sortValue`` for ``note`` so Keep web mirrors the
+    desktop order in ``ordered`` (left-to-right == top-to-bottom).
+
+    The bug we're guarding against here: ``ordered`` is keyed by
+    ``local_order``, which can disagree with each note's ``sort_key``
+    after a push failure or sync race. So the immediate visual
+    neighbour in ``ordered`` is NOT always the right anchor — for
+    edge moves (top / bottom) we need to dominate / be dominated by
+    every other note's sort_key, not just the neighbour. Otherwise
+    Keep web only sees a one-step move when the user asked for
+    "move to top" or "move to bottom".
+
+    Pure function for testability; no side effects.
+    """
+    def _sv(n):
+        try:
+            return int(getattr(n, "sort_key", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        new_idx = ordered.index(note)
+    except ValueError:
+        return _sv(note) or _REORDER_STEP
+
+    above = ordered[new_idx - 1] if new_idx > 0 else None
+    below = ordered[new_idx + 1] if new_idx < len(ordered) - 1 else None
+    other_svs = [_sv(n) for n in ordered if n is not note]
+
+    if above is None and below is not None:
+        # "Move to top" — must beat every other sort_key on the wire,
+        # not just the visual neighbour.
+        return (max(other_svs) if other_svs else 0) + _REORDER_STEP
+    if below is None and above is not None:
+        # "Move to bottom" — symmetric.
+        return (min(other_svs) if other_svs else 0) - _REORDER_STEP
+    if above is not None and below is not None:
+        a, b = _sv(above), _sv(below)
+        if a == b:
+            return a - 1  # tiebreak
+        new_sv = (a + b) // 2
+        if new_sv == a or new_sv == b:
+            return a - 1
+        return new_sv
+    # Single-note list: keep whatever sort_key it had.
+    return _sv(note) or _REORDER_STEP
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Login Dialog – Embedded browser Google sign-in
 # ═══════════════════════════════════════════════════════════════════════
@@ -875,6 +930,15 @@ class AppController(QObject):
         # still untrashed on the server and re-add it locally — which
         # then reappears in the manager after relaunch.
         self._pending_deletes: set[str] = set()
+        # Notes that have gone missing from a single sync response.
+        # We require them to be missing for ``STRIKES_TO_DELETE``
+        # consecutive syncs before treating it as a real remote
+        # deletion — otherwise a transient sync that returns fewer
+        # notes than usual (server hiccup, push response that only
+        # echoes the changed node, etc.) wipes notes that quietly
+        # come back next cycle, producing visible churn in the
+        # manager dialog. Maps note_id -> consecutive miss count.
+        self._missing_strikes: dict[str, int] = {}
         # Per-note timestamp of the last user edit. Used to decide
         # whether a focused note window is "actively being edited" or
         # just sitting open — if it's been idle long enough we let
@@ -1315,38 +1379,7 @@ class AppController(QObject):
         # Spacing of 10 leaves room for incremental tweaks later.
         for i, n in enumerate(ordered):
             n.local_order = (i + 1) * 10
-        # Compute a new sortValue for the moved note so Keep web mirrors
-        # the desktop order. Keep uses descending sortValue (higher =
-        # higher in list). Pick a value strictly between the new
-        # neighbours; if at an edge, bracket past them.
-        try:
-            new_idx = ordered.index(note)
-        except ValueError:
-            new_idx = idx
-        STEP = 1 << 22  # ~4M; matches Keep's typical step granularity
-        above = ordered[new_idx - 1] if new_idx > 0 else None
-        below = ordered[new_idx + 1] if new_idx < len(ordered) - 1 else None
-
-        def _sv(n):
-            try:
-                return int(n.sort_key or 0)
-            except (TypeError, ValueError):
-                return 0
-        if above is None and below is not None:
-            new_sv = _sv(below) + STEP
-        elif below is None and above is not None:
-            new_sv = _sv(above) - STEP
-        elif above is not None and below is not None:
-            a, b = _sv(above), _sv(below)
-            if a == b:
-                new_sv = a - 1  # tiebreak
-            else:
-                new_sv = (a + b) // 2
-                # Avoid collision with either neighbour.
-                if new_sv == a or new_sv == b:
-                    new_sv = a - 1
-        else:
-            new_sv = _sv(note) or STEP
+        new_sv = _compute_new_sort_value(ordered, note)
         note.sort_key = new_sv
         self._save_notes_to_disk()
         self._refresh_manager_if_open()
@@ -1827,15 +1860,38 @@ class AppController(QObject):
         # Remove notes that no longer exist on Keep (deleted on another
         # device). Guard against an empty remote list — that usually
         # means the fetch failed, and we don't want to wipe everything.
+        # Also defer single-cycle absences (a metadata push response or
+        # incremental sync sometimes echoes fewer nodes than usual)
+        # via ``_missing_strikes`` so we don't flicker notes out of the
+        # manager only to immediately re-add them next cycle.
+        STRIKES_TO_DELETE = 2
         if remote_notes:
             remote_ids = {rn.id for rn in remote_notes}
             for nid in list(self._notes.keys()):
                 if nid in remote_ids:
+                    self._missing_strikes.pop(nid, None)
                     continue
                 if nid in self._dirty:
                     # Local edit still being pushed — don't remove.
                     continue
+                # Real Keep server ids are ``timestamp.user`` and
+                # always contain a dot. Anything else is a local UUID
+                # that hasn't been promoted to a server id yet (e.g.
+                # _push_new_note hasn't completed) — those won't ever
+                # show up in remote_ids by construction.
+                if "." not in nid:
+                    continue
+                strikes = self._missing_strikes.get(nid, 0) + 1
+                self._missing_strikes[nid] = strikes
+                if strikes < STRIKES_TO_DELETE:
+                    log.info(
+                        "Note %s missing from sync (strike %d/%d); "
+                        "deferring delete",
+                        nid[:8], strikes, STRIKES_TO_DELETE,
+                    )
+                    continue
                 log.info("Note %s removed remotely; deleting locally", nid[:8])
+                self._missing_strikes.pop(nid, None)
                 self._notes.pop(nid, None)
                 self._visibility.pop(nid, None)
                 win = self.windows.pop(nid, None)
