@@ -1042,6 +1042,8 @@ class AppController(QObject):
     def _load_notes_from_disk(self):
         from config import NOTES_FILE
         data = load_json(NOTES_FILE, {})
+        log.info("Loading %d notes from disk cache (%s)",
+                 len(data), NOTES_FILE)
         for nid, d in data.items():
             note = KeepNote(
                 id=d["id"],

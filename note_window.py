@@ -34,23 +34,121 @@ _LIGHT_MENU_QSS = (
 def _start_native_drag(window) -> bool:
     """Hand the drag off to Windows so the user gets Aero Snap behaviour
     (drag-to-edge to half-tile, drag-to-top to maximize, etc.) on our
-    frameless windows. Returns True on success."""
-    import sys
-    if sys.platform != "win32":
+    frameless windows. Returns True on success.
+
+    Disabled on translucent frameless windows (the standard NoteWindow
+    case) because Windows does not show the snap preview overlay for
+    layered windows — and once the OS owns the drag we never get a
+    mouseRelease event to fall back to manual snap. We instead rely on
+    :func:`_snap_window_to_drop_zone` which the manual drag handlers
+    invoke on mouse release.
+    """
+    return False
+
+
+def _compute_snap_target(global_pos: QPoint) -> QRect | None:
+    """Return the QRect ``window`` should occupy if dropped at
+    ``global_pos``, or ``None`` if no snap zone applies.
+
+    Zones (mirrors Windows' default behaviour):
+      * top edge  → maximize
+      * left edge / right edge → half tile
+      * each corner → quarter tile
+    """
+    from PySide6.QtGui import QGuiApplication
+    screen = (QGuiApplication.screenAt(global_pos)
+              or QGuiApplication.primaryScreen())
+    if screen is None:
+        return None
+    avail = screen.availableGeometry()
+    edge = 8           # px from the actual edge to count as "on edge"
+    corner = 80        # px from the perpendicular edge to count as corner
+    x, y = global_pos.x(), global_pos.y()
+    on_left   = (x - avail.left())   <= edge
+    on_right  = (avail.right() - x)  <= edge
+    on_top    = (y - avail.top())    <= edge
+    near_top    = (y - avail.top())    <= corner
+    near_bottom = (avail.bottom() - y) <= corner
+
+    half_w = avail.width() // 2
+    half_h = avail.height() // 2
+    if on_left and near_top:
+        return QRect(avail.left(), avail.top(), half_w, half_h)
+    if on_left and near_bottom:
+        return QRect(avail.left(), avail.top() + half_h, half_w, half_h)
+    if on_right and near_top:
+        return QRect(avail.left() + half_w, avail.top(), half_w, half_h)
+    if on_right and near_bottom:
+        return QRect(avail.left() + half_w, avail.top() + half_h, half_w, half_h)
+    if on_top:
+        return QRect(avail)
+    if on_left:
+        return QRect(avail.left(), avail.top(), half_w, avail.height())
+    if on_right:
+        return QRect(avail.left() + half_w, avail.top(), half_w, avail.height())
+    return None
+
+
+def _snap_window_to_drop_zone(window, global_pos: QPoint) -> bool:
+    """If ``global_pos`` is inside a snap zone, resize/move ``window`` to
+    fill it and return True. Otherwise return False."""
+    target = _compute_snap_target(global_pos)
+    if target is None:
         return False
-    try:
-        import ctypes
-        hwnd = int(window.winId())
-        # Release any current capture, then ask the non-client area to
-        # treat the press as a caption click — that's what triggers the
-        # OS window-management gestures.
-        WM_NCLBUTTONDOWN = 0x00A1
-        HTCAPTION = 2
-        ctypes.windll.user32.ReleaseCapture()
-        ctypes.windll.user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    window.setGeometry(target)
+    return True
+
+
+class _SnapPreview(QWidget):
+    """Translucent blue rectangle shown while dragging a window near a
+    snap zone, mirroring Windows' Aero Snap preview. Single shared
+    instance — see :func:`_snap_preview_show` / :func:`_snap_preview_hide`.
+    """
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Windows-11-style: pale blue fill, blue border, rounded corners.
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        p.setBrush(QColor(0, 120, 215, 70))
+        pen = QPen(QColor(0, 120, 215, 200))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawRoundedRect(rect, 8, 8)
+        p.end()
+
+
+_snap_preview_widget: "_SnapPreview | None" = None
+
+
+def _snap_preview_show(target: QRect):
+    """Show or move the shared snap-preview overlay to ``target``."""
+    global _snap_preview_widget
+    if _snap_preview_widget is None:
+        _snap_preview_widget = _SnapPreview()
+    w = _snap_preview_widget
+    w.setGeometry(target)
+    if not w.isVisible():
+        w.show()
+    w.raise_()
+
+
+def _snap_preview_hide():
+    global _snap_preview_widget
+    if _snap_preview_widget is not None and _snap_preview_widget.isVisible():
+        _snap_preview_widget.hide()
 
 
 # ── Color Picker Popup ────────────────────────────────────────────────
@@ -371,12 +469,26 @@ class DragHandle(QWidget):
 
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
-            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
+            gp = event.globalPosition().toPoint()
+            self.window().move(gp - self._drag_pos)
+            target = _compute_snap_target(gp)
+            if target is not None:
+                _snap_preview_show(target)
+            else:
+                _snap_preview_hide()
             event.accept()
 
-    def mouseReleaseEvent(self, _event):
+    def mouseReleaseEvent(self, event):
+        was_dragging = self._drag_pos is not None
         self._drag_pos = None
         win = self.window()
+        _snap_preview_hide()
+        if was_dragging:
+            try:
+                _snap_window_to_drop_zone(
+                    win, event.globalPosition().toPoint())
+            except Exception:  # noqa: BLE001
+                pass
         if hasattr(win, "save_geometry"):
             win.save_geometry()
 
@@ -549,12 +661,26 @@ class TitleBar(QWidget):
 
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
-            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
+            gp = event.globalPosition().toPoint()
+            self.window().move(gp - self._drag_pos)
+            target = _compute_snap_target(gp)
+            if target is not None:
+                _snap_preview_show(target)
+            else:
+                _snap_preview_hide()
 
     def mouseReleaseEvent(self, event):
+        was_dragging = self._drag_pos is not None
         self._drag_pos = None
-        # Save position after drag
         win = self.window()
+        _snap_preview_hide()
+        if was_dragging:
+            try:
+                _snap_window_to_drop_zone(
+                    win, event.globalPosition().toPoint())
+            except Exception:  # noqa: BLE001
+                pass
+        # Save position after drag
         if hasattr(win, "save_geometry"):
             win.save_geometry()
 
@@ -570,9 +696,18 @@ class _LinkHighlighter(QSyntaxHighlighter):
 
     # Same pattern as NoteTextEdit, kept duplicated so the highlighter
     # can be a top-level class and not depend on import order.
+    # Phone alts: bare 0-prefix national numbers (AU/UK/etc, 9–12 digits),
+    # international with + prefix, separator-style, and parens area-code.
     _LINK_RE = __import__("re").compile(
-        r"(mailto:[^\s<>]+|https?://[^\s<>]+|www\.[^\s<>]+|"
-        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+        r"(mailto:[^\s<>]+|tel:[+\d][\d\s.\-()]+|https?://[^\s<>]+|www\.[^\s<>]+|"
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|"
+        r"(?<!\d)(?:"
+        r"\+\d[\d .\-()]{7,16}\d|"
+        r"\(\d{2,4}\)[ .\-]?\d{2,4}[ .\-]?\d{2,5}|"
+        r"0\d{8,11}|"
+        r"(?!(?:19|20)\d{6})\d{8}|"
+        r"\d{2,4}[ .\-]\d{2,4}[ .\-]\d{3,5}"
+        r")(?!\d))"
     )
 
     def __init__(self, document):
@@ -589,10 +724,20 @@ class _LinkHighlighter(QSyntaxHighlighter):
 class NoteTextEdit(QTextEdit):
     """Rich text editor area for the note body."""
 
-    # URL/email detection: matches http(s)://, www., and bare email/mailto:.
+    # URL/email/phone detection: matches http(s)://, www., bare email,
+    # mailto:/tel: schemes, and phone numbers — including bare AU/UK
+    # style 0-prefixed 10-digit numbers (e.g. 0478114466) and bare
+    # international + numbers (e.g. +61478114466).
     _LINK_RE = __import__("re").compile(
-        r"(mailto:[^\s<>]+|https?://[^\s<>]+|www\.[^\s<>]+|"
-        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+        r"(mailto:[^\s<>]+|tel:[+\d][\d\s.\-()]+|https?://[^\s<>]+|www\.[^\s<>]+|"
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|"
+        r"(?<!\d)(?:"
+        r"\+\d[\d .\-()]{7,16}\d|"
+        r"\(\d{2,4}\)[ .\-]?\d{2,4}[ .\-]?\d{2,5}|"
+        r"0\d{8,11}|"
+        r"(?!(?:19|20)\d{6})\d{8}|"
+        r"\d{2,4}[ .\-]\d{2,4}[ .\-]\d{3,5}"
+        r")(?!\d))"
     )
 
     def __init__(self, parent=None):
@@ -760,6 +905,13 @@ class NoteTextEdit(QTextEdit):
             url = "https://" + url
         elif "@" in url and not url.startswith("mailto:") and "://" not in url:
             url = "mailto:" + url
+        elif (not url.startswith(("http://", "https://", "mailto:", "tel:"))
+              and "@" not in url):
+            # Phone number: strip formatting whitespace/punctuation so the
+            # OS handler (Skype, Teams, dialer, etc.) gets a clean number.
+            digits = "".join(ch for ch in url if ch.isdigit() or ch == "+")
+            if digits:
+                url = "tel:" + digits
         QDesktopServices.openUrl(QUrl(url))
 
     def mouseMoveEvent(self, event):
@@ -1084,7 +1236,7 @@ class ChecklistRow(QFrame):
                  editor: "ChecklistEditor | None" = None):
         super().__init__(editor)
         self._editor_ref = editor
-        self._indent = max(0, int(indent))
+        self._indent = max(0, min(1, int(indent)))
         self.cbx_id = cbx_id or ""
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -1156,7 +1308,7 @@ class ChecklistRow(QFrame):
         return self._indent
 
     def set_indent(self, level: int):
-        level = max(0, min(int(level), 4))
+        level = max(0, min(int(level), 1))
         if level == self._indent:
             return
         self._indent = level
@@ -1257,6 +1409,7 @@ class ChecklistEditor(QScrollArea):
         # Drag-reorder state
         self._dragging_row: ChecklistRow | None = None
         self._drag_start_global: QPoint | None = None
+        self._drag_indent_baseline_x: int = 0
         self._drag_anim: QPropertyAnimation | None = None
 
     # ── public API ────────────────────────────────────────────────────
@@ -1273,7 +1426,7 @@ class ChecklistEditor(QScrollArea):
                 row = ChecklistRow(
                     text=it.get("text", ""),
                     checked=bool(it.get("checked", False)),
-                    indent=int(it.get("indent", 0) or 0),
+                    indent=min(1, int(it.get("indent", 0) or 0)),
                     cbx_id=it.get("cbx_id", "") or "",
                     editor=self,
                 )
@@ -1343,60 +1496,239 @@ class ChecklistEditor(QScrollArea):
 
     # ── drag-reorder ──────────────────────────────────────────────────
     def begin_drag(self, row: ChecklistRow, global_pos: QPoint):
+        if row not in self._rows:
+            return
         self._dragging_row = row
         self._drag_start_global = global_pos
+        self._drag_indent_baseline_x = global_pos.x()
         row.raise_()
+
+    # Keep's API rejects nesting deeper than one level (HTTP 400). We
+    # mirror that limit on the client.
+    _MAX_INDENT = 1
+
+    def _children_of(self, row: ChecklistRow) -> list[ChecklistRow]:
+        """Consecutive rows whose indent is greater than ``row.indent`` and
+        immediately follow ``row`` in :pyattr:`_rows`. These are the rows
+        that should move with their parent during a drag."""
+        try:
+            idx = self._rows.index(row)
+        except ValueError:
+            return []
+        base = row.indent
+        out: list[ChecklistRow] = []
+        for r in self._rows[idx + 1:]:
+            if r.indent > base:
+                out.append(r)
+            else:
+                break
+        return out
+
+    def _parent_group_bounds(self, row: ChecklistRow) -> tuple[int, int]:
+        """Return (start_idx, end_idx_exclusive) of the contiguous block
+        owned by the top-level parent of ``row``. For an indent-0 row
+        this is the row itself plus its children. For a child row this
+        is its parent's range. Used to clamp drags so children can't
+        escape their parent group."""
+        try:
+            idx = self._rows.index(row)
+        except ValueError:
+            return (0, len(self._rows))
+        # Walk back to the nearest indent-0 row.
+        start = idx
+        while start > 0 and self._rows[start].indent > 0:
+            start -= 1
+        end = start + 1 + len(self._children_of(self._rows[start]))
+        return (start, end)
 
     def update_drag(self, global_pos: QPoint):
         row = self._dragging_row
         if row is None or self._drag_start_global is None:
             return
-        delta_y = global_pos.y() - self._drag_start_global.y()
-        if abs(delta_y) < row.height() // 2:
+
+        # ── Horizontal: indent / outdent ─────────────────────────────
+        dx = global_pos.x() - self._drag_indent_baseline_x
+        if abs(dx) >= _INDENT_PX:
+            steps = int(dx / _INDENT_PX)
+            try:
+                idx = self._rows.index(row)
+            except ValueError:
+                return
+            # First row is always indent 0. Otherwise can be one deeper
+            # than predecessor, capped at _MAX_INDENT.
+            prev_indent = self._rows[idx - 1].indent if idx > 0 else -1
+            max_indent = min(self._MAX_INDENT, prev_indent + 1)
+            new_indent = max(0, min(max_indent, row.indent + steps))
+            if new_indent != row.indent:
+                shift = new_indent - row.indent
+                self._suppress_changed = True
+                try:
+                    # Only carry children when changing a top-level
+                    # parent's indent. A child's indent change affects
+                    # only that child.
+                    if row.indent == 0:
+                        for child in self._children_of(row):
+                            child.set_indent(
+                                max(0, min(self._MAX_INDENT,
+                                           child.indent + shift)))
+                    row.set_indent(new_indent)
+                finally:
+                    self._suppress_changed = False
+                self._on_changed()
+            self._drag_indent_baseline_x += steps * _INDENT_PX
+
+        # ── Vertical: reorder ────────────────────────────────────────
+        dy = global_pos.y() - self._drag_start_global.y()
+        if abs(dy) < max(8, row.height() // 2):
             return
-        # Decide direction
         try:
             idx = self._rows.index(row)
         except ValueError:
             return
-        if delta_y > 0 and idx < len(self._rows) - 1:
-            self._swap_rows(idx, idx + 1)
-            self._drag_start_global = global_pos
-        elif delta_y < 0 and idx > 0:
-            self._swap_rows(idx, idx - 1)
-            self._drag_start_global = global_pos
+
+        if row.indent == 0:
+            # Parent: subtree includes children; reorder against other
+            # top-level blocks. Boundary: unchecked can't pass below
+            # checked and vice versa.
+            subtree_len = 1 + len(self._children_of(row))
+            if dy > 0:
+                next_idx = idx + subtree_len
+                if next_idx >= len(self._rows):
+                    return
+                next_row = self._rows[next_idx]
+                if (not row.is_checked()) and next_row.is_checked():
+                    return
+                next_block_size = 1 + len(self._children_of(next_row))
+                self._move_block(idx, subtree_len, idx + next_block_size)
+            else:
+                if idx == 0:
+                    return
+                # Walk back to the start of the preceding top-level block.
+                start = idx - 1
+                while start > 0 and self._rows[start].indent > 0:
+                    start -= 1
+                prev_row = self._rows[start]
+                if row.is_checked() and (not prev_row.is_checked()):
+                    return
+                self._move_block(idx, subtree_len, start)
+        else:
+            # Child: stays inside its parent group. Reorder among
+            # sibling children only.
+            grp_start, grp_end = self._parent_group_bounds(row)
+            if dy > 0:
+                # Find next sibling at same indent within the group.
+                next_idx = None
+                for j in range(idx + 1, grp_end):
+                    if self._rows[j].indent == row.indent:
+                        next_idx = j
+                        break
+                if next_idx is None:
+                    return
+                # Swap with next sibling (move past it; single row only).
+                self._move_block(idx, 1, next_idx + 1)
+            else:
+                # Find previous sibling at same indent within the group
+                # (must remain after the parent at grp_start).
+                prev_sib = None
+                for j in range(idx - 1, grp_start, -1):
+                    if self._rows[j].indent == row.indent:
+                        prev_sib = j
+                        break
+                if prev_sib is None:
+                    return
+                self._move_block(idx, 1, prev_sib)
+
+        self._drag_start_global = global_pos
+
+    def _move_block(self, src_idx: int, length: int, dst_idx: int):
+        """Move ``self._rows[src_idx:src_idx+length]`` so that the block's
+        new starting index is ``dst_idx``. Updates both the data list
+        and the layout, and emits :pyattr:`changed`."""
+        if src_idx == dst_idx or length <= 0:
+            return
+        block = self._rows[src_idx:src_idx + length]
+        # Capture starting geometry of the lead row for the slide animation.
+        lead = block[0]
+        start_geom = QRect(lead.geometry())
+        del self._rows[src_idx:src_idx + length]
+        if dst_idx > src_idx:
+            dst_idx -= length
+        for i, r in enumerate(block):
+            self._rows.insert(dst_idx + i, r)
+        for r in block:
+            self._vbox.removeWidget(r)
+        for i, r in enumerate(block):
+            self._vbox.insertWidget(dst_idx + i, r)
+        QTimer.singleShot(0, lambda: self._animate_into_place(lead, start_geom))
+        self._on_changed()
 
     def end_drag(self):
         self._dragging_row = None
         self._drag_start_global = None
 
     def _on_row_checked(self, row: "ChecklistRow", checked: bool):
-        """Auto-sort: when a row is checked it sinks to the bottom of
-        the list (below any other unchecked rows). When unchecked, it
-        rises to just above the first checked row. Mirrors Keep web's
-        behaviour and keeps active todos visually grouped at the top."""
-        try:
-            cur_idx = self._rows.index(row)
-        except ValueError:
+        """Re-sort the list around the new check state, respecting
+        parent/child grouping.
+
+        Rules (mirrors Keep web's behaviour for indented checklists):
+
+        * The list is split into "subtrees" — each subtree is one
+          top-level (indent=0) row plus its consecutive indent>0
+          children.
+        * A subtree is *completed* iff every row in it is checked.
+        * Completed subtrees sink to the bottom of the list as a unit.
+          A parent that is checked but still has unchecked children
+          stays in the active area — its children dictate its
+          location, not its own check state.
+        * Within an active subtree, children are also reordered so
+          unchecked siblings appear before checked ones (stable).
+          Children of completed subtrees keep their order.
+        * The order of subtrees within each section (active /
+          completed) is preserved relative to their pre-toggle order.
+        """
+        if not self._rows:
             return
-        if checked:
-            # Move to the very end.
-            target_idx = len(self._rows) - 1
-        else:
-            # Move to just above the first checked row (or end if none).
-            first_checked = next(
-                (i for i, r in enumerate(self._rows)
-                 if r is not row and r.is_checked()),
-                len(self._rows),
+
+        # 1. Build subtrees as lists of rows in their current order.
+        subtrees: list[list[ChecklistRow]] = []
+        for r in self._rows:
+            if r.indent == 0 or not subtrees:
+                subtrees.append([r])
+            else:
+                subtrees[-1].append(r)
+
+        def _is_completed(sub: list[ChecklistRow]) -> bool:
+            return all(x.is_checked() for x in sub)
+
+        # 2. Reorder children within each *active* subtree so unchecked
+        #    siblings rise above checked ones. Parent stays at index 0.
+        for sub in subtrees:
+            if len(sub) <= 1 or _is_completed(sub):
+                continue
+            head, kids = sub[0], sub[1:]
+            kids_sorted = sorted(
+                enumerate(kids),
+                key=lambda pair: (pair[1].is_checked(), pair[0]),
             )
-            target_idx = max(0, first_checked - (1 if cur_idx < first_checked else 0))
-        if target_idx == cur_idx:
+            sub[1:] = [k for _, k in kids_sorted]
+
+        # 3. Stable partition: active subtrees first, completed last.
+        active = [s for s in subtrees if not _is_completed(s)]
+        done = [s for s in subtrees if _is_completed(s)]
+        new_order: list[ChecklistRow] = []
+        for sub in active + done:
+            new_order.extend(sub)
+
+        if new_order == self._rows:
             return
+
+        # 4. Apply new order to data + layout. Animate the toggled row.
         start_geom = QRect(row.geometry())
-        self._rows.pop(cur_idx)
-        self._rows.insert(target_idx, row)
-        self._vbox.removeWidget(row)
-        self._vbox.insertWidget(target_idx, row)
+        for r in self._rows:
+            self._vbox.removeWidget(r)
+        self._rows = new_order
+        for i, r in enumerate(self._rows):
+            self._vbox.insertWidget(i, r)
         QTimer.singleShot(0, lambda: self._animate_into_place(row, start_geom))
 
     def _swap_rows(self, i: int, j: int):

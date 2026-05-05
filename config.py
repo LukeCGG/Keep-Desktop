@@ -7,7 +7,7 @@ import sys
 import winreg
 
 APP_NAME = "KeepDesktop"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 # GitHub repository (owner/name) used for the auto-updater.
 GITHUB_REPO = "LukeCGG/Keep-Desktop"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -235,3 +235,108 @@ def test_list_diff_complex_mixed_change():
         if o[0] == "docs-nestedModel" and o[1][3] == "cbx.a"
     ]
     assert text_ops
+
+
+def test_list_diff_text_multi_edit_uses_back_to_front_ordering():
+    """When a row's text has two non-adjacent edits, the ds/is ops MUST
+    be emitted in back-to-front order so each op's positions are still
+    valid when applied. Forward order would compute positions against
+    a document that has already been mutated by an earlier op, and the
+    server would reject the resulting diff with HTTP 400."""
+    # Old: "abc def ghi" (length 11)
+    # New: "abc XX def YY ghi" — two inserts: "XX " at pos 4 and "YY "
+    # near the middle. The encoder should emit the later insert first.
+    old = [_item("cbx.a", "abc def ghi", position=(0,))]
+    new = [_item("cbx.a", "abc XX def YY ghi", position=(0,))]
+    ops = encode_list_diff(SCT, old, new)
+    is_ops = [
+        op for op in ops
+        if op[0] == "docs-nestedModel"
+        and isinstance(op[2], dict) and op[2].get("ty") == "is"
+    ]
+    assert len(is_ops) == 2, f"expected 2 inserts, got {is_ops!r}"
+    # Back-to-front: the op with the larger insertion index comes first.
+    assert is_ops[0][2]["ibi"] > is_ops[1][2]["ibi"], (
+        f"text inserts must be back-to-front, got {is_ops!r}"
+    )
+
+
+def test_list_diff_indent_change_uses_rm_add_not_cross_level_mv():
+    """A row whose indent changes between old and new must not be
+    pushed via cbx-mv across levels (Keep's API rejects those with
+    HTTP 400 'Invalid Value'). The encoder should fall back to
+    cbx-rm of the old row + cbx-add of a fresh row at the new
+    position."""
+    old = [
+        _item("cbx.a", "parent", position=(0,)),
+        _item("cbx.b", "was top-level", position=(1,)),
+    ]
+    new = [
+        _item("cbx.a", "parent", position=(0,)),
+        # cbx.b is now indented under cbx.a.
+        _item("cbx.b", "was top-level", position=(0, 0)),
+    ]
+    ops = encode_list_diff(SCT, old, new)
+    heads = [o[0] for o in ops]
+    # Must NOT emit a cross-level cbx-mv.
+    cross_level_mvs = [
+        o for o in ops
+        if o[0] == "cbx-mv" and len(o[2]) != len(o[3])
+    ]
+    assert not cross_level_mvs, (
+        f"encoder must not emit cross-level cbx-mv ops, got {cross_level_mvs!r}"
+    )
+    # Must remove the old row and add a fresh one.
+    rm_ops = [o for o in ops if o[0] == "cbx-rm" and o[2] == "cbx.b"]
+    add_ops = [o for o in ops if o[0] == "cbx-add"]
+    assert rm_ops, f"expected cbx-rm of cbx.b, got {ops!r}"
+    assert add_ops, f"expected a cbx-add for the indented re-add, got {ops!r}"
+    # The fresh add should land at the indented position.
+    assert add_ops[0][3] == [0, 0]
+
+
+def test_list_diff_sibling_reorder_within_parent():
+    """Reordering two children within the same parent should emit
+    cbx-mv ops scoped to that parent, using the parent's NEW
+    top-level index as the position prefix."""
+    old = [
+        _item("cbx.p", "parent", position=(0,)),
+        _item("cbx.c1", "child 1", position=(0, 0)),
+        _item("cbx.c2", "child 2", position=(0, 1)),
+    ]
+    new = [
+        _item("cbx.p", "parent", position=(0,)),
+        _item("cbx.c2", "child 2", position=(0, 0)),
+        _item("cbx.c1", "child 1", position=(0, 1)),
+    ]
+    ops = encode_list_diff(SCT, old, new)
+    mv_ops = [o for o in ops if o[0] == "cbx-mv"]
+    assert len(mv_ops) == 1, f"expected 1 sibling cbx-mv, got {mv_ops!r}"
+    # Move c2 from [0, 1] to [0, 0] — the parent prefix is preserved.
+    assert mv_ops[0][2] == [0, 1]
+    assert mv_ops[0][3] == [0, 0]
+
+
+def test_list_diff_full_top_level_reorder_uses_sequential_mvs():
+    """Reordering 3 top-level rows should emit sequential cbx-mv ops
+    that, applied in order, transform old→new without referencing
+    stale positions."""
+    old = [
+        _item("cbx.a", "A", position=(0,)),
+        _item("cbx.b", "B", position=(1,)),
+        _item("cbx.c", "C", position=(2,)),
+    ]
+    new = [
+        _item("cbx.c", "C", position=(0,)),
+        _item("cbx.a", "A", position=(1,)),
+        _item("cbx.b", "B", position=(2,)),
+    ]
+    ops = encode_list_diff(SCT, old, new)
+    mv_ops = [o for o in ops if o[0] == "cbx-mv"]
+    # Simulate the moves on a list and check the result matches `new`.
+    state = ["cbx.a", "cbx.b", "cbx.c"]
+    for mv in mv_ops:
+        src = mv[2][0]
+        dst = mv[3][0]
+        state.insert(dst, state.pop(src))
+    assert state == ["cbx.c", "cbx.a", "cbx.b"]

@@ -763,7 +763,9 @@ def encode_list_diff(
       2. For each common item (matched by id):
          - `docs-nestedModel is/ds` ops to align text.
          - `cbx-p [cb:ck, bool]` if checked-state changed.
-         - `cbx-mv` if its position changed.
+      2b. `cbx-mv` ops to reorder surviving items into their target
+         order. Items whose indent level changed are converted to
+         remove+add (Keep's API rejects cross-level cbx-mv with 400).
       3. `cbx-add` (+ text insert + cbx-p if checked) for each new item.
 
     Returns a flat op list (caller wraps in `docs-mlti`).
@@ -781,11 +783,35 @@ def encode_list_diff(
         else:
             fresh_items.append(it)
 
+    # Promote indent-changers to remove+add. Cross-level cbx-mv (e.g.
+    # [2] -> [1, 0]) is unreliable on Keep's server — sometimes 400s,
+    # sometimes silently rejected — so we sidestep it entirely by
+    # treating an indent change as "this is a new row; the old one
+    # went away". We keep the original cbx_id on the re-add so the
+    # row's identity survives across the rewrite.
+    indent_changed: list[str] = []
+    for cbx_id in list(new_by_id.keys()):
+        old_indent = max(0, len(tuple(old_by_id[cbx_id].position)) - 1)
+        new_indent = max(0, len(tuple(new_by_id[cbx_id].position)) - 1)
+        if old_indent != new_indent:
+            indent_changed.append(cbx_id)
+    for cbx_id in indent_changed:
+        new_it = new_by_id.pop(cbx_id)
+        # Mint a fresh id — re-using a just-removed id risks the server
+        # treating the cbx-add as a no-op against the prior state.
+        fresh_items.append(CheckboxItem(
+            cbx_id="",
+            text=new_it.text,
+            checked=new_it.checked,
+            position=new_it.position,
+        ))
+
     ops: list = []
 
-    # 1. Removals — anything in old but not referenced by new. Emit
-    # cbx-rm in DESCENDING position order so each rm doesn't shift
-    # the indices used by later rms.
+    # 1. Removals — anything in old but not referenced by new (or
+    # promoted to a re-add by the indent-change pass). Emit cbx-rm in
+    # DESCENDING position order so each rm doesn't shift the indices
+    # used by later rms.
     removed_ids: set[str] = set()
     rm_targets: list[tuple[tuple[int, ...], str]] = []
     for cbx_id, old_it in old_by_id.items():
@@ -809,22 +835,23 @@ def encode_list_diff(
                 a=old_it.text, b=new_it.text, autojunk=False,
             )
             row_target = ["text", 0, list_sct_id, cbx_id]
-            text_ops: list = []
+            # Walk back-to-front so each op's positions remain valid
+            # in the current (pre-op) text. The server applies them
+            # in array order; later positions are touched first so
+            # earlier positions don't shift. Mirrors encode_text_diff.
             for tag, i1, i2, j1, j2 in reversed(sm.get_opcodes()):
                 if tag == "equal":
                     continue
                 if tag in ("delete", "replace") and i2 > i1:
-                    text_ops.append([
+                    ops.append([
                         "docs-nestedModel", row_target,
                         {"ty": "ds", "si": i1 + 1, "ei": i2},
                     ])
                 if tag in ("insert", "replace") and j2 > j1:
-                    text_ops.append([
+                    ops.append([
                         "docs-nestedModel", row_target,
                         {"ty": "is", "ibi": i1 + 1, "s": new_it.text[j1:j2]},
                     ])
-            text_ops.reverse()
-            ops.extend(text_ops)
 
         # --- checked toggle ---
         if bool(old_it.checked) != bool(new_it.checked):
@@ -833,46 +860,81 @@ def encode_list_diff(
                 ["cb:ck", bool(new_it.checked)],
             ])
 
-    # 2b. Reorder pass — cbx-mv ops apply sequentially. Compute the
-    # current order of surviving items (post-removals, pre-moves) and
-    # the target order, then emit moves that incrementally transform
-    # the former into the latter. Each cbx-mv shifts the positions of
-    # everything between the source and the destination, so we walk
-    # left-to-right and only move whichever item is in the wrong
-    # cell at index `i`. Top-level rows only — nested indents fall
-    # back to absolute-position emission below.
+    # 2b. Reorder pass — cbx-mv ops apply sequentially. After indent
+    # changes have been promoted to rm+add (above), every surviving
+    # item has the same indent level it had on the server. We can
+    # therefore reduce the move problem to:
+    #   * top-level reorder among parents
+    #   * sibling reorder within each parent's children
+    # Each is a flat list and the standard "walk left-to-right, find
+    # the wanted id, emit cbx-mv [j] [i]" sequential algorithm works.
     surviving_old = sorted(
         (old_by_id[cid] for cid in old_by_id if cid not in removed_ids),
         key=lambda it: tuple(it.position),
     )
     target_order = [it for it in new_items if it.cbx_id in new_by_id]
-    cur_ids = [it.cbx_id for it in surviving_old]
-    tgt_ids = [it.cbx_id for it in target_order]
-    only_top_level = (
-        all(len(tuple(it.position)) <= 1 for it in surviving_old)
-        and all(len(tuple(it.position)) <= 1 for it in target_order)
-    )
-    if only_top_level and set(cur_ids) == set(tgt_ids):
-        for i in range(len(tgt_ids)):
-            if cur_ids[i] == tgt_ids[i]:
+
+    def _emit_flat_moves(cur: list[str], tgt: list[str], pos_prefix: list[int]) -> None:
+        """Emit cbx-mv ops to transform ``cur`` (cbx_ids in current
+        tree order) into ``tgt``. Positions are encoded as
+        ``pos_prefix + [i]`` — empty prefix for top-level, ``[parent_i]``
+        for a parent's children. Mutates ``cur`` to track the running
+        server-side state as each move is applied."""
+        if cur == tgt:
+            return
+        for i in range(len(tgt)):
+            if i < len(cur) and cur[i] == tgt[i]:
                 continue
-            j = cur_ids.index(tgt_ids[i], i)
+            try:
+                j = cur.index(tgt[i], i)
+            except ValueError:
+                # Shouldn't happen if cur and tgt have the same set of
+                # ids, but bail rather than emit invalid positions.
+                continue
             ops.append([
-                "cbx-mv", list_sct_id, [j], [i],
+                "cbx-mv", list_sct_id,
+                pos_prefix + [j], pos_prefix + [i],
             ])
-            cur_ids.insert(i, cur_ids.pop(j))
-    else:
-        # Indented or mismatched-set fallback: emit absolute-position
-        # cbx-mv per matched item whose position changed. May produce
-        # redundant ops but keeps backwards-compatible behaviour.
-        for cbx_id, new_it in new_by_id.items():
-            old_it = old_by_id[cbx_id]
-            if tuple(old_it.position) != tuple(new_it.position):
-                ops.append([
-                    "cbx-mv", list_sct_id,
-                    list(old_it.position),
-                    list(new_it.position),
-                ])
+            cur.insert(i, cur.pop(j))
+
+    # Top-level reorder among parents.
+    cur_top = [it.cbx_id for it in surviving_old if len(tuple(it.position)) <= 1]
+    tgt_top = [it.cbx_id for it in target_order if len(tuple(it.position)) <= 1]
+    if set(cur_top) == set(tgt_top):
+        _emit_flat_moves(list(cur_top), tgt_top, [])
+
+    # Per-parent sibling reorder. A parent's "current" children are
+    # whatever items currently live under index `parent_idx` in the
+    # post-top-level-reorder server state; their target children are
+    # whatever lives under that parent's NEW index in target_order.
+    # We key by parent cbx_id so the reorder survives a shifted parent.
+    def _children_by_parent(items, ids_in_top_order):
+        out: dict[str, list[str]] = {p: [] for p in ids_in_top_order}
+        parent_lookup = list(ids_in_top_order)
+        for it in items:
+            pos = tuple(it.position)
+            if len(pos) <= 1:
+                continue
+            parent_idx = pos[0]
+            if 0 <= parent_idx < len(parent_lookup):
+                out.setdefault(parent_lookup[parent_idx], []).append(it.cbx_id)
+        return out
+
+    cur_kids = _children_by_parent(surviving_old, cur_top)
+    tgt_kids = _children_by_parent(target_order, tgt_top)
+    for parent_id, tgt_ids in tgt_kids.items():
+        cur_ids = cur_kids.get(parent_id, [])
+        if set(cur_ids) != set(tgt_ids):
+            # Set differs — child added or removed at this level.
+            # Skip: those rows were already handled by removals or
+            # the indent-change rm+add path.
+            continue
+        # The parent's NEW top-level index drives the cbx-mv prefix.
+        try:
+            parent_idx = tgt_top.index(parent_id)
+        except ValueError:
+            continue
+        _emit_flat_moves(list(cur_ids), tgt_ids, [parent_idx])
 
     # 3. Fresh additions.
     for it in fresh_items:

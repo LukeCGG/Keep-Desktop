@@ -28,6 +28,9 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# ── CLAUDE ─────────────────────────────────────────────────────
+.claude/
+
 # ── KeepDesktop local state (just in case) ─────────────────────
 *.dat
 keep_token.dat

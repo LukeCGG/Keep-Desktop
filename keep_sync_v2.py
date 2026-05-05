@@ -631,9 +631,35 @@ class KeepSyncV2:
                 keep_note.html = ""
                 push_html = merged_text
             elif remote_changed and not local_changed:
-                # Remote moved, local didn't — nothing to push. The
-                # remote refresh path will pick up the new content on
-                # the next pull.
+                # Remote moved, local didn't (text-wise). Body push
+                # would be a no-op; but title/colour edits live on
+                # the node payload not in the body diff, so we still
+                # need to push those if they changed locally. Compare
+                # against the pre-mutation server snapshot we captured
+                # above (original_server_*).
+                title_changed = (keep_note.title or "") != original_server_title
+                color_changed = bool(wire_color) and wire_color != original_server_color
+                if title_changed or color_changed:
+                    try:
+                        self._client.update_note_metadata(
+                            server,
+                            new_title=(keep_note.title or "")
+                                       if title_changed else None,
+                            new_color=wire_color if color_changed else None,
+                        )
+                        log.info(
+                            "v2 push: %s metadata-only push (title=%s color=%s)",
+                            keep_note.id[:8],
+                            title_changed, color_changed,
+                        )
+                    except KeepError as exc:
+                        log.warning(
+                            "v2 push: metadata-only push failed for %s: %s",
+                            keep_note.id[:8], exc,
+                        )
+                        return False
+                    self._base_text[keep_note.id] = server_text
+                    return True
                 log.info(
                     "v2 push: skipping %s; remote changed but local "
                     "matches base (no local edits)", keep_note.id[:8],
@@ -859,15 +885,30 @@ class KeepSyncV2:
             return tuple(base) + (idx,)
 
         out: list[CheckboxItem] = []
+        # Track the index of the most recent top-level (indent=0) row
+        # so indent=1 children are encoded as (parent_idx, child_idx)
+        # rather than (i-1, i) — the latter produces 2-level positions
+        # like (1, 2) when two consecutive children share a parent,
+        # which the Keep API rejects with HTTP 400 "Invalid Value".
+        last_parent_idx: int = 0
+        child_counter: int = 0
+
         # Fast-path: the UI already tagged each row with an id.
         if all(isinstance(r, dict) and r.get("cbx_id") for r in local_rows):
             for i, r in enumerate(local_rows):
+                indent = min(1, int(r.get("indent", 0) or 0))
+                if indent <= 0:
+                    last_parent_idx = i
+                    child_counter = 0
+                    pos: tuple[int, ...] = (i,)
+                else:
+                    pos = (last_parent_idx, child_counter)
+                    child_counter += 1
                 out.append(CheckboxItem(
                     cbx_id=str(r["cbx_id"]),
                     text=str(r.get("text", "")),
                     checked=bool(r.get("checked")),
-                    position=(i,) if not int(r.get("indent", 0) or 0)
-                             else (max(0, i - 1), i),
+                    position=pos,
                 ))
             return out
 
@@ -885,13 +926,22 @@ class KeepSyncV2:
                 for k in range(i2 - i1):
                     local_to_server[j1 + k] = server_items[i1 + k].cbx_id
 
+        last_parent_idx = 0
+        child_counter = 0
         for i, r in enumerate(local_rows):
             cbx_id = local_to_server.get(i, "")
             # If the local row also carries an explicit cbx_id, prefer it.
             if isinstance(r, dict) and r.get("cbx_id"):
                 cbx_id = str(r["cbx_id"])
-            indent = int(r.get("indent", 0) or 0) if isinstance(r, dict) else 0
-            position = (i,) if indent <= 0 else (max(0, i - 1), i)
+            indent = (min(1, int(r.get("indent", 0) or 0))
+                      if isinstance(r, dict) else 0)
+            if indent <= 0:
+                last_parent_idx = i
+                child_counter = 0
+                position: tuple[int, ...] = (i,)
+            else:
+                position = (last_parent_idx, child_counter)
+                child_counter += 1
             out.append(CheckboxItem(
                 cbx_id=cbx_id,
                 text=str(r.get("text", "")),
@@ -903,18 +953,32 @@ class KeepSyncV2:
     @staticmethod
     def _derive_list_items(keep_note: KeepNote) -> list[dict]:
         """Return a uniform `[{"text": str, "checked": bool, "cbx_id": str?}, ...]`
-        list, preferring `keep_note.list_items` over rendered text."""
+        list, preferring `keep_note.list_items` over rendered text.
+
+        Indent values are clamped to {0, 1} (Keep API only supports one
+        nesting level — anything deeper triggers HTTP 400 Invalid Value)
+        and the first row is forced to indent=0 so subsequent indent=1
+        rows always have a real parent to attach to.
+        """
         if keep_note.list_items:
             out = []
+            seen_parent = False
             for it in keep_note.list_items:
                 if isinstance(it, dict):
+                    indent = min(1, max(0, int(it.get("indent", 0) or 0)))
+                    if indent > 0 and not seen_parent:
+                        # Promote orphan child to top-level parent.
+                        indent = 0
+                    if indent == 0:
+                        seen_parent = True
                     out.append({
                         "text": str(it.get("text", "")),
                         "checked": bool(it.get("checked")),
                         "cbx_id": str(it.get("cbx_id", "")) or None,
-                        "indent": int(it.get("indent", 0) or 0),
+                        "indent": indent,
                     })
                 else:
+                    seen_parent = True
                     out.append({"text": str(it), "checked": False,
                                 "cbx_id": None, "indent": 0})
             return out
