@@ -22,7 +22,7 @@ Run it, click through, done. KeepDesktop will be in your Start menu and (optiona
 - **System tray** — lives quietly in your taskbar tray
 - **Auto-start** — optional "Start with Windows" toggle
 - **Auto-update** — silent in-place updates from GitHub Releases
-- **Color-coded** — all 12 Google Keep colors
+- **Color-coded** — all 12 Google Keep colors + local dark mode varients
 - **Pin notes** — toggle always-on-top per note
 - **Minimal UI** — frameless, clean, stays out of your way
 
@@ -77,8 +77,10 @@ GitHub Actions does this automatically on every `v*` tag — see `.github/workfl
 ## How It Works
 
 - Config, positions, notes cache, and the auth token live in `%APPDATA%\KeepDesktop\`
-- Sync uses the unofficial [`gkeepapi`](https://github.com/kiwiz/gkeepapi) library
-- Auth uses [`gpsoauth`](https://github.com/simon-weber/gpsoauth) — your password is never stored, only the master token
+- Sync talks directly to Google Keep's internal
+  `notes-pa.clients6.google.com/notes/v1/changes` endpoint via
+  `keep_protocol/`
+- Auth uses [`gpsoauth`](https://github.com/simon-weber/gpsoauth) — your password is never stored, only the master token locally
 - Notes created offline are pushed to Keep on the next sync
 
 ## Files
@@ -88,7 +90,10 @@ GitHub Actions does this automatically on every `v*` tag — see `.github/workfl
 | `main.py` | Entry point |
 | `app_controller.py` | Tray icon, note lifecycle, sync orchestration |
 | `note_window.py` | Individual sticky-note window (frameless Qt widget) |
-| `keep_sync.py` | Google Keep API wrapper |
+| `keep_protocol/` | First-party Keep `/notes/v1/changes` client (auth, encode, decode, models) |
+| `keep_sync_v2.py` | High-level sync engine on top of `keep_protocol` |
+| `keep_sync.py` | Legacy compatibility shim (KeepNote dataclass + colour maps) |
+| `sync_merge.py` | Three-way local/remote merge decisions |
 | `updater.py` | GitHub Releases auto-updater |
 | `config.py` | Settings, positions, autostart, paths, version |
 | `KeepDesktop.spec` | PyInstaller build spec |

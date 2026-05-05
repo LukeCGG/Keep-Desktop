@@ -7,7 +7,12 @@ import sys
 import winreg
 
 APP_NAME = "KeepDesktop"
-APP_VERSION = "2.1.1"
+# Stamped at release time by .github/workflows/release.yml from the
+# git tag (e.g. v2.1.1 → "2.1.1"). Leave this as the dev sentinel in
+# source — do NOT bump manually for releases. "0.0.0" means any real
+# GitHub release will appear newer to the updater, so dev builds get
+# offered the latest installer.
+APP_VERSION = "0.0.0"
 # GitHub repository (owner/name) used for the auto-updater.
 GITHUB_REPO = "LukeCGG/Keep-Desktop"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
