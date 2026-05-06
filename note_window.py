@@ -995,11 +995,17 @@ class NoteTextEdit(QTextEdit):
                 and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
             self._paste_plain_text()
             return
-        # Auto-insert checkbox prefix on Enter in list notes
+        # Enter should always create a real new line. QTextEdit's default
+        # Return handling inserts a rich-text paragraph block and tries to
+        # carry paragraph/heading formatting forward; pressing Return twice
+        # can then appear to "adjust" the previous blank line instead of
+        # adding another one. Insert a literal newline instead and reset the
+        # typing format to normal body text for whatever comes next.
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             cursor = self.textCursor()
             block = cursor.block()
             text = block.text()
+            # Auto-insert checkbox prefix on Enter in legacy glyph-list notes.
             if text.startswith("☑") or text.startswith("☐"):
                 # If the current line is just an empty checkbox, remove it instead
                 stripped = text.lstrip("☑☐").strip()
@@ -1022,6 +1028,19 @@ class NoteTextEdit(QTextEdit):
                 new_cursor.insertText(" ", body_fmt)
                 self.setTextCursor(new_cursor)
                 return
+            cursor.insertText("\n")
+            self.setTextCursor(cursor)
+            body_fmt = QTextCharFormat()
+            body_fmt.setFontPointSize(10)
+            body_fmt.setFontWeight(QFont.Weight.Normal)
+            body_fmt.setFontItalic(False)
+            body_fmt.setFontUnderline(False)
+            body_fmt.setFontStrikeOut(False)
+            body_fmt.setForeground(QColor("#333"))
+            self.setCurrentCharFormat(body_fmt)
+            self._apply_tight_block_format()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def _resort_checklist(self):
