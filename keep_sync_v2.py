@@ -1376,8 +1376,4 @@ def html_to_styled_doc(html: str, *, sct_id: Optional[str] = None) -> StyledDoc:
         paragraphs.append(Paragraph(runs=runs, heading=heading))
         block = block.next()
 
-    # Trim a trailing empty paragraph that Qt likes to add.
-    while len(paragraphs) > 1 and not paragraphs[-1].runs:
-        paragraphs.pop()
-
     return StyledDoc(sct_id=sct_id, paragraphs=paragraphs)

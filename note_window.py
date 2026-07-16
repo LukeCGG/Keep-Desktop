@@ -354,6 +354,15 @@ class FormattingToolbar(QWidget):
                 break
             if not c.movePosition(QTextCursor.MoveOperation.NextBlock):
                 break
+        # The block-walk above only restyles *existing* runs. A blank
+        # paragraph has no runs, so without this its typing format never
+        # picks up the new size — text typed right after choosing a
+        # heading for an empty line would appear at the old size until
+        # the next reload. mergeCurrentCharFormat on the (possibly
+        # collapsed) live cursor updates the format future keystrokes use.
+        size_fmt = QTextCharFormat()
+        size_fmt.setFontPointSize(target_size)
+        self._text_edit.mergeCurrentCharFormat(size_fmt)
         cursor.endEditBlock()
         self._text_edit.setFocus()
         self._update_states()
@@ -820,12 +829,15 @@ class NoteTextEdit(QTextEdit):
                 if i > 0:
                     cur.insertBlock(base_block)
                 # Heading sizing (no bold — Keep web matches this).
+                # Sizes must match FormattingToolbar._set_heading's scale
+                # or headings visibly jump in size on the next refresh.
                 bf = QTextBlockFormat(base_block)
+                bf.setHeadingLevel(para.heading)
                 heading_size = None
                 if para.heading == 1:
-                    heading_size = 18
+                    heading_size = 16
                 elif para.heading == 2:
-                    heading_size = 14
+                    heading_size = 13
                 cur.setBlockFormat(bf)
                 for run in para.runs:
                     if not run.text:
@@ -1030,6 +1042,15 @@ class NoteTextEdit(QTextEdit):
                 return
             cursor.insertText("\n")
             self.setTextCursor(cursor)
+            # insertText("\n") splits the block, which carries the old
+            # block's QTextBlockFormat (including headingLevel) forward.
+            # A new line should always start as body text, never a
+            # still-a-heading blank line, or the stray heading survives
+            # into whatever the user types next and gets pushed/rendered
+            # as an oversized heading after the next sync.
+            new_block_fmt = QTextBlockFormat(cursor.blockFormat())
+            new_block_fmt.setHeadingLevel(0)
+            cursor.setBlockFormat(new_block_fmt)
             body_fmt = QTextCharFormat()
             body_fmt.setFontPointSize(10)
             body_fmt.setFontWeight(QFont.Weight.Normal)
