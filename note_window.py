@@ -8,15 +8,53 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel, QLineEdit,
-    QPushButton, QMenu, QSizeGrip, QGraphicsDropShadowEffect,
+    QPushButton, QMenu, QGraphicsDropShadowEffect,
     QGridLayout, QToolButton, QCheckBox, QScrollArea, QFrame,
     QStyleOptionButton, QStyle, QApplication,
 )
 
+from keep_protocol.nested_model import u16_len
 from config import (
     KEEP_COLORS, KEEP_COLORS_DARK, DEFAULT_WIDTH, DEFAULT_HEIGHT,
     MIN_WIDTH, MIN_HEIGHT, set_position, get_position,
 )
+
+
+# ── Global font scale ───────────────────────────────────────────────────
+# One multiplier applied to every hardcoded font size in a note window
+# (body, headings, toolbar, title, checklist). 1.0 = the original design
+# sizes below. Set via set_font_scale(); read via _scaled_pt/_scaled_px
+# at the point each font/format is built, so newly-created widgets pick
+# up the current value automatically. Already-open windows only update
+# when their own set_font_scale() is called (see NoteWindow.set_font_scale).
+FONT_SCALE = 1.0
+
+BASE_BODY_PT = 10.0
+BASE_H1_PT = 16.0
+BASE_H2_PT = 13.0
+BASE_TOOLBAR_BTN_PT = 9.0
+BASE_TITLE_PT = 10.0
+BASE_TITLEBAR_BTN_PX = 14
+BASE_CHECKLIST_PT = 10.0
+BASE_CHARCOUNT_PX = 9
+BASE_BULLET_PX = 14
+
+
+def set_font_scale(scale: float):
+    """Set the process-wide default font scale for newly-built widgets.
+
+    Does not touch already-open NoteWindows — call their own
+    ``set_font_scale`` to rescale existing content live."""
+    global FONT_SCALE
+    FONT_SCALE = max(0.5, min(3.0, float(scale)))
+
+
+def _scaled_pt(base_pt: float) -> float:
+    return round(base_pt * FONT_SCALE, 1)
+
+
+def _scaled_px(base_px: int) -> int:
+    return max(1, round(base_px * FONT_SCALE))
 
 
 # Shared light-mode menu style. Forces dark-on-white so Windows' OS-level
@@ -277,7 +315,7 @@ class FormattingToolbar(QWidget):
 
     def _make_btn(self, label, weight=None, italic=False, underline=False, strikeout=False):
         btn = QPushButton(label)
-        f = QFont("Segoe UI", 9)
+        f = QFont("Segoe UI", round(_scaled_pt(BASE_TOOLBAR_BTN_PT)))
         if weight:
             f.setWeight(weight)
         f.setItalic(italic)
@@ -297,25 +335,59 @@ class FormattingToolbar(QWidget):
         """)
         return btn
 
+    def set_font_scale(self):
+        """Re-apply the current global FONT_SCALE to the toolbar's own
+        buttons. Text/heading sizes inside the note body are handled
+        separately by NoteWindow.set_font_scale (they need the
+        extract/reload round-trip, not just a font swap)."""
+        pt = round(_scaled_pt(BASE_TOOLBAR_BTN_PT))
+        for btn, kwargs in (
+            (self.bold_btn, {"weight": QFont.Weight.Bold}),
+            (self.italic_btn, {"italic": True}),
+            (self.underline_btn, {"underline": True}),
+            (self.strike_btn, {"strikeout": True}),
+            (self.clear_fmt_btn, {}),
+        ):
+            f = QFont("Segoe UI", pt)
+            if kwargs.get("weight"):
+                f.setWeight(kwargs["weight"])
+            f.setItalic(kwargs.get("italic", False))
+            f.setUnderline(kwargs.get("underline", False))
+            f.setStrikeOut(kwargs.get("strikeout", False))
+            btn.setFont(f)
+
     def _toggle_bold(self):
-        fmt = self._text_edit.currentCharFormat()
-        new_w = QFont.Weight.Normal if fmt.fontWeight() >= QFont.Weight.Bold else QFont.Weight.Bold
-        fmt.setFontWeight(new_w)
+        # A fresh, minimal QTextCharFormat with ONLY font weight set --
+        # not a mutated copy of currentCharFormat(). currentCharFormat()
+        # reflects whatever's at the cursor's OWN end of the selection
+        # (not necessarily where the selection started), which — for a
+        # selection spanning a heading and body text of different
+        # sizes — carries the heading's full resolved format (size
+        # included). mergeCurrentCharFormat then applies EVERY property
+        # set on the format object across the WHOLE selection, so a
+        # copy-then-mutate here silently reapplies the heading's font
+        # size onto the body text too, not just the toggled weight.
+        currently_bold = self._text_edit.currentCharFormat().fontWeight() >= QFont.Weight.Bold
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Weight.Normal if currently_bold else QFont.Weight.Bold)
         self._text_edit.mergeCurrentCharFormat(fmt)
 
     def _toggle_italic(self):
-        fmt = self._text_edit.currentCharFormat()
-        fmt.setFontItalic(not fmt.fontItalic())
+        currently_italic = self._text_edit.currentCharFormat().fontItalic()
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(not currently_italic)
         self._text_edit.mergeCurrentCharFormat(fmt)
 
     def _toggle_underline(self):
-        fmt = self._text_edit.currentCharFormat()
-        fmt.setFontUnderline(not fmt.fontUnderline())
+        currently_underlined = self._text_edit.currentCharFormat().fontUnderline()
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(not currently_underlined)
         self._text_edit.mergeCurrentCharFormat(fmt)
 
     def _toggle_strikethrough(self):
-        fmt = self._text_edit.currentCharFormat()
-        fmt.setFontStrikeOut(not fmt.fontStrikeOut())
+        currently_struck = self._text_edit.currentCharFormat().fontStrikeOut()
+        fmt = QTextCharFormat()
+        fmt.setFontStrikeOut(not currently_struck)
         self._text_edit.mergeCurrentCharFormat(fmt)
 
     def _set_heading(self, level: int):
@@ -324,8 +396,12 @@ class FormattingToolbar(QWidget):
         block if nothing is selected)."""
         cursor = self._text_edit.textCursor()
         # Sizes match Keep web's heading scale: H1 ~1.5x, H2 ~1.25x.
-        sizes = {0: 10.0, 1: 16.0, 2: 13.0}
-        target_size = sizes.get(level, 10.0)
+        sizes = {
+            0: _scaled_pt(BASE_BODY_PT),
+            1: _scaled_pt(BASE_H1_PT),
+            2: _scaled_pt(BASE_H2_PT),
+        }
+        target_size = sizes.get(level, _scaled_pt(BASE_BODY_PT))
         cursor.beginEditBlock()
         if cursor.hasSelection():
             start, end = sorted((cursor.anchor(), cursor.position()))
@@ -368,14 +444,35 @@ class FormattingToolbar(QWidget):
         self._update_states()
 
     def _clear_formatting(self):
-        """Strip rich-text formatting from the selection (or whole note)."""
+        """Strip bold/italic/underline/strikethrough from the SELECTION.
+
+        Two things this deliberately does not do:
+
+        It does not fall back to selecting the whole document when
+        nothing is selected. "Remove formatting" with no selection used
+        to wipe every style in the note — a destructive, easily
+        mis-clicked action whose only undo was waiting for the next sync
+        to argue it back.
+
+        And it merges rather than replaces. setCharFormat() REPLACES
+        every property, including the font point size that carries
+        heading sizing (set_styled_doc and _set_heading both stamp it on
+        each run). Wiping it left every heading at point size 0 —
+        unset — so Qt rendered them all at the widget's default body
+        size and an H1 and an H2 became indistinguishable. Merging an
+        explicit "off" for just the four character styles leaves size,
+        and therefore heading appearance, intact.
+        """
         cursor = self._text_edit.textCursor()
         if not cursor.hasSelection():
-            cursor.select(cursor.SelectionType.Document)
+            return
         plain_fmt = QTextCharFormat()
-        # setCharFormat REPLACES (rather than merges) every property,
-        # so it actually wipes bold/italic/underline/strike/colour/size.
-        cursor.setCharFormat(plain_fmt)
+        plain_fmt.setFontWeight(QFont.Weight.Normal)
+        plain_fmt.setFontItalic(False)
+        plain_fmt.setFontUnderline(False)
+        plain_fmt.setFontStrikeOut(False)
+        cursor.mergeCharFormat(plain_fmt)
+        self._update_states()
 
     def _update_states(self):
         fmt = self._text_edit.currentCharFormat()
@@ -502,6 +599,32 @@ class DragHandle(QWidget):
             win.save_geometry()
 
 
+class TitleDragSliver(DragHandle):
+    """Thin full-width strip just below the title bar, giving the user
+    an extra, more visible drag surface — the title bar itself is mostly
+    consumed by the editable title field and the pin/colour/close
+    buttons, leaving little room to grab. Reuses DragHandle's mouse
+    logic (native-drag attempt, manual move + snap preview) as-is; only
+    the size and appearance differ, so this only overrides __init__ and
+    paintEvent."""
+
+    def __init__(self, parent=None):
+        QWidget.__init__(self, parent)
+        self.setFixedHeight(6)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip("Drag to move note")
+        self._drag_pos = None
+        self._dark = False
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(
+            self.rect(),
+            QColor(255, 255, 255, 30) if self._dark else QColor(0, 0, 0, 30),
+        )
+        painter.end()
+
+
 class TitleBar(QWidget):
     """Custom draggable title bar for a note window."""
 
@@ -536,7 +659,9 @@ class TitleBar(QWidget):
         # construction, which scrolls the view so the user only sees
         # the tail of long titles.
         self.title_edit.setCursorPosition(0)
-        self.title_edit.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.title_edit.setFont(
+            QFont("Segoe UI", round(_scaled_pt(BASE_TITLE_PT)), QFont.Weight.Bold)
+        )
         self.title_edit.setStyleSheet(
             "QLineEdit { color: #222; background: transparent; border: none;"
             "            padding: 0px; font-weight: bold; }"
@@ -597,6 +722,14 @@ class TitleBar(QWidget):
         self._restyle_widgets()
         self.drag_handle.set_dark(dark)
 
+    def set_font_scale(self):
+        """Re-apply the current global FONT_SCALE to the title font and
+        the pin/colour/close button glyph size."""
+        self.title_edit.setFont(
+            QFont("Segoe UI", round(_scaled_pt(BASE_TITLE_PT)), QFont.Weight.Bold)
+        )
+        self._restyle_widgets()
+
     def _restyle_widgets(self):
         if self._dark:
             text_color, hover, focus_bg, btn_color = (
@@ -616,7 +749,7 @@ class TitleBar(QWidget):
         )
         btn_qss = (
             "QPushButton {"
-            f"  border: none; border-radius: 3px; font-size: 14px;"
+            f"  border: none; border-radius: 3px; font-size: {_scaled_px(BASE_TITLEBAR_BTN_PX)}px;"
             f"  color: {btn_color}; padding: 2px 6px; background: transparent;"
             "}"
             f"QPushButton:hover {{ background: {hover}; }}"
@@ -726,8 +859,18 @@ class _LinkHighlighter(QSyntaxHighlighter):
         self._fmt.setFontUnderline(True)
 
     def highlightBlock(self, text: str) -> None:
+        # setFormat() indexes in UTF-16 code units (Qt strings are
+        # UTF-16), while `text` is a Python str indexed in codepoints
+        # and the regex offsets below come from that. The two agree
+        # across the whole BMP but diverge by one per astral character,
+        # so a single emoji earlier in the line dragged every later
+        # link's blue-underline one character out of place.
         for m in self._LINK_RE.finditer(text):
-            self.setFormat(m.start(), m.end() - m.start(), self._fmt)
+            self.setFormat(
+                u16_len(text[:m.start()]),
+                u16_len(text[m.start():m.end()]),
+                self._fmt,
+            )
 
 
 class NoteTextEdit(QTextEdit):
@@ -751,7 +894,7 @@ class NoteTextEdit(QTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFont(QFont("Segoe UI", 10))
+        self.setFont(QFont("Segoe UI", round(_scaled_pt(BASE_BODY_PT))))
         self.setAcceptRichText(True)
         # Qt's built-in HTML renderer applies font-weight:bold to <h1>
         # and <h2> by default. Keep web does NOT — headings there are
@@ -776,12 +919,60 @@ class NoteTextEdit(QTextEdit):
         cur = self.textCursor()
         cur.select(cur.SelectionType.Document)
         cur.mergeBlockFormat(_bf)
+        self.setStyleSheet("""
+            QTextEdit {
+                border: none;
+                background: transparent;
+                padding: 8px;
+                color: #333;
+                selection-color: #000;
+                selection-background-color: rgba(66,133,244,0.35);
+            }
+            QScrollBar:vertical {
+                width: 6px; background: transparent;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(0,0,0,0.15); border-radius: 3px;
+                min-height: 30px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+        """)
+        self.setPlaceholderText("Type your note here...")
+        # Required so mouseMoveEvent fires during Ctrl+hover (not just
+        # while a button is held).
+        self.viewport().setMouseTracking(True)
+        self.setMouseTracking(True)
+        # Visual styling for URLs/emails (blue + underline). Click
+        # behaviour stays Ctrl+click via mousePressEvent below. This
+        # must live in __init__, not set_styled_doc — it used to be
+        # (mis-nested as) the tail end of set_styled_doc's body, which
+        # meant the highlighter was never created for a note's INITIAL
+        # load (NoteWindow.__init__ populates the widget via
+        # setPlainText/setHtml, not set_styled_doc) — phone numbers
+        # and links only lit up once the FIRST sync-driven refresh
+        # happened to call set_styled_doc and create it for the first
+        # time, which is why it "eventually" worked after a sync but
+        # never on boot.
+        self._link_highlighter = _LinkHighlighter(self.document())
 
     def _apply_tight_block_format(self):
         """Re-apply zero-margin block formatting to every paragraph in
         the document. Needed after setHtml/setPlainText because Qt
-        re-creates the blocks with their default (non-tight) format."""
-        from PySide6.QtGui import QTextBlockFormat
+        re-creates the blocks with their default (non-tight) format.
+
+        Also normalizes heading font sizes to the app's own scale.
+        Qt's HTML importer sizes <h1>/<h2> using its own built-in
+        heading scale (relative to the base font), which does not
+        match _scaled_pt(BASE_H1_PT)/BASE_H2_PT -- the size
+        set_styled_doc explicitly applies on every sync-driven
+        refresh. Without this, a note's very first render (boot-time
+        setHtml from the disk cache, before any styled_doc exists)
+        showed headings at Qt's own (larger) size, which then visibly
+        shrank the moment the first sync replaced it via
+        set_styled_doc."""
+        from PySide6.QtGui import QTextBlockFormat, QTextCharFormat, QTextCursor
         bf = QTextBlockFormat()
         bf.setTopMargin(0)
         bf.setBottomMargin(0)
@@ -791,6 +982,27 @@ class NoteTextEdit(QTextEdit):
         try:
             cur.select(cur.SelectionType.Document)
             cur.mergeBlockFormat(bf)
+
+            doc = self.document()
+            block = doc.begin()
+            while block.isValid():
+                level = block.blockFormat().headingLevel()
+                if level == 1:
+                    size = _scaled_pt(BASE_H1_PT)
+                elif level == 2:
+                    size = _scaled_pt(BASE_H2_PT)
+                else:
+                    block = block.next()
+                    continue
+                block_start = block.position()
+                block_end = block_start + block.length() - 1
+                cf = QTextCharFormat()
+                cf.setFontPointSize(size)
+                sel = QTextCursor(doc)
+                sel.setPosition(block_start)
+                sel.setPosition(block_end, QTextCursor.MoveMode.KeepAnchor)
+                sel.mergeCharFormat(cf)
+                block = block.next()
         finally:
             cur.endEditBlock()
 
@@ -831,20 +1043,24 @@ class NoteTextEdit(QTextEdit):
                 # Heading sizing (no bold — Keep web matches this).
                 # Sizes must match FormattingToolbar._set_heading's scale
                 # or headings visibly jump in size on the next refresh.
+                # Always explicit (even for body/heading 0) — this makes
+                # set_styled_doc double as the mechanism that rescales
+                # already-typed text when the global font scale changes
+                # (see NoteWindow.set_font_scale), not just fresh loads.
                 bf = QTextBlockFormat(base_block)
                 bf.setHeadingLevel(para.heading)
-                heading_size = None
                 if para.heading == 1:
-                    heading_size = 16
+                    heading_size = _scaled_pt(BASE_H1_PT)
                 elif para.heading == 2:
-                    heading_size = 13
+                    heading_size = _scaled_pt(BASE_H2_PT)
+                else:
+                    heading_size = _scaled_pt(BASE_BODY_PT)
                 cur.setBlockFormat(bf)
                 for run in para.runs:
                     if not run.text:
                         continue
                     cf = QTextCharFormat()
-                    if heading_size is not None:
-                        cf.setFontPointSize(heading_size)
+                    cf.setFontPointSize(heading_size)
                     if run.bold:
                         cf.setFontWeight(QFont.Weight.Bold)
                     if run.italic:
@@ -856,34 +1072,6 @@ class NoteTextEdit(QTextEdit):
                     cur.insertText(run.text, cf)
         finally:
             cur.endEditBlock()
-        self.setStyleSheet("""
-            QTextEdit {
-                border: none;
-                background: transparent;
-                padding: 8px;
-                color: #333;
-                selection-color: #000;
-                selection-background-color: rgba(66,133,244,0.35);
-            }
-            QScrollBar:vertical {
-                width: 6px; background: transparent;
-            }
-            QScrollBar::handle:vertical {
-                background: rgba(0,0,0,0.15); border-radius: 3px;
-                min-height: 30px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
-            }
-        """)
-        self.setPlaceholderText("Type your note here...")
-        # Required so mouseMoveEvent fires during Ctrl+hover (not just
-        # while a button is held).
-        self.viewport().setMouseTracking(True)
-        self.setMouseTracking(True)
-        # Visual styling for URLs/emails (blue + underline). Click
-        # behaviour stays Ctrl+click via mousePressEvent below.
-        self._link_highlighter = _LinkHighlighter(self.document())
 
     # ── Ctrl+click link activation ─────────────────────────────────────
 
@@ -895,9 +1083,16 @@ class NoteTextEdit(QTextEdit):
         if not block.isValid():
             return None
         block_text = block.text()
+        # positionInBlock() and block.position() are Qt offsets (UTF-16
+        # code units); the regex match offsets below are Python
+        # codepoints. Convert the match, not the cursor, so an emoji
+        # earlier in the line doesn't shift which characters count as
+        # part of the link.
         col = cursor.positionInBlock()
         for m in self._LINK_RE.finditer(block_text):
-            if m.start() <= col <= m.end():
+            u16_start = u16_len(block_text[:m.start()])
+            u16_end = u16_len(block_text[:m.end()])
+            if u16_start <= col <= u16_end:
                 url = m.group(0)
                 # Strip common trailing punctuation that's almost
                 # certainly not part of the URL (sentence-final
@@ -905,8 +1100,8 @@ class NoteTextEdit(QTextEdit):
                 stripped = url.rstrip(").,;:!?]\u201d\u2019")
                 return (
                     stripped,
-                    block.position() + m.start(),
-                    block.position() + m.start() + len(stripped),
+                    block.position() + u16_start,
+                    block.position() + u16_start + u16_len(stripped),
                 )
         return None
 
@@ -945,6 +1140,21 @@ class NoteTextEdit(QTextEdit):
             self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
         super().keyReleaseEvent(event)
 
+    def _text_colors(self):
+        """(normal, muted) foreground colours matching the parent
+        NoteWindow's current light/dark palette (see
+        NoteWindow._apply_color). Enter and the legacy checkbox-toggle
+        both bake an explicit foreground into the char format they
+        build — without this they hardcoded the light-mode colour,
+        making freshly-typed text unreadable against a dark background."""
+        win = self.parent()
+        while win and not isinstance(win, NoteWindow):
+            win = win.parent()
+        dark = bool(getattr(win, "_dark_mode", False))
+        if dark:
+            return QColor("#f1f3f4"), QColor("#9aa0a6")
+        return QColor("#333"), QColor("#888")
+
     def mousePressEvent(self, event):
         # Ctrl+left-click on a URL/email opens it in the system handler.
         if (event.button() == Qt.MouseButton.LeftButton
@@ -970,30 +1180,31 @@ class NoteTextEdit(QTextEdit):
                 # Toggle the checkbox character
                 was_checked = text.startswith("☑")
                 new_char = "☐" if was_checked else "☑"
+                normal_color, muted_color = self._text_colors()
                 cursor.movePosition(cursor.MoveOperation.StartOfBlock)
                 cursor.movePosition(cursor.MoveOperation.Right, cursor.MoveMode.KeepAnchor, 1)
                 if was_checked:
                     # Was checked → now unchecked: remove strikethrough + grey
                     cursor.removeSelectedText()
                     fmt = QTextCharFormat()
-                    fmt.setFontPointSize(14)
+                    fmt.setFontPointSize(_scaled_pt(BASE_BULLET_PX))
                     cursor.insertText(new_char, fmt)
                     cursor.movePosition(cursor.MoveOperation.EndOfBlock, cursor.MoveMode.KeepAnchor)
                     line_fmt = QTextCharFormat()
                     line_fmt.setFontStrikeOut(False)
-                    line_fmt.setForeground(QColor("#333"))
+                    line_fmt.setForeground(normal_color)
                     cursor.mergeCharFormat(line_fmt)
                 else:
                     # Was unchecked → now checked: add strikethrough + grey
                     cursor.removeSelectedText()
                     fmt = QTextCharFormat()
-                    fmt.setFontPointSize(14)
-                    fmt.setForeground(QColor("#888"))
+                    fmt.setFontPointSize(_scaled_pt(BASE_BULLET_PX))
+                    fmt.setForeground(muted_color)
                     cursor.insertText(new_char, fmt)
                     cursor.movePosition(cursor.MoveOperation.EndOfBlock, cursor.MoveMode.KeepAnchor)
                     line_fmt = QTextCharFormat()
                     line_fmt.setFontStrikeOut(True)
-                    line_fmt.setForeground(QColor("#888"))
+                    line_fmt.setForeground(muted_color)
                     cursor.mergeCharFormat(line_fmt)
                 # Re-sort: unchecked on top, checked on bottom
                 self._resort_checklist()
@@ -1032,11 +1243,11 @@ class NoteTextEdit(QTextEdit):
                 # Insert checkbox prefix on the new line
                 new_cursor = self.textCursor()
                 fmt = QTextCharFormat()
-                fmt.setFontPointSize(14)
+                fmt.setFontPointSize(_scaled_pt(BASE_BULLET_PX))
                 new_cursor.insertText("☐", fmt)
                 body_fmt = QTextCharFormat()
                 body_fmt.setFontStrikeOut(False)
-                body_fmt.setForeground(QColor("#333"))
+                body_fmt.setForeground(self._text_colors()[0])
                 new_cursor.insertText(" ", body_fmt)
                 self.setTextCursor(new_cursor)
                 return
@@ -1052,12 +1263,12 @@ class NoteTextEdit(QTextEdit):
             new_block_fmt.setHeadingLevel(0)
             cursor.setBlockFormat(new_block_fmt)
             body_fmt = QTextCharFormat()
-            body_fmt.setFontPointSize(10)
+            body_fmt.setFontPointSize(_scaled_pt(BASE_BODY_PT))
             body_fmt.setFontWeight(QFont.Weight.Normal)
             body_fmt.setFontItalic(False)
             body_fmt.setFontUnderline(False)
             body_fmt.setFontStrikeOut(False)
-            body_fmt.setForeground(QColor("#333"))
+            body_fmt.setForeground(self._text_colors()[0])
             self.setCurrentCharFormat(body_fmt)
             self._apply_tight_block_format()
             event.accept()
@@ -1140,46 +1351,76 @@ class NoteTextEdit(QTextEdit):
         menu.exec(event.globalPos())
 
 
-class ResizeGrip(QWidget):
-    """Small bottom-right resize handle."""
+_RESIZE_MARGIN = 6  # px of grabbable border on each edge/corner
 
-    def __init__(self, parent=None):
+
+class EdgeResizeHandle(QWidget):
+    """Thin invisible strip along one edge or corner of a NoteWindow's
+    border. Dragging it resizes the window from that side, extending the
+    old bottom-right-only grip to all 4 edges and 4 corners.
+
+    ``edge`` is a compass string ("n", "s", "e", "w", "ne", "nw", "se",
+    "sw") — corners contain two letters, so both axes are adjusted at
+    once. Positioned via manual setGeometry() calls from the parent
+    NoteWindow's resizeEvent, not a layout (it floats on top of the
+    container so it keeps receiving mouse events regardless of what's
+    laid out underneath it)."""
+
+    _CURSORS = {
+        "n": Qt.CursorShape.SizeVerCursor,
+        "s": Qt.CursorShape.SizeVerCursor,
+        "e": Qt.CursorShape.SizeHorCursor,
+        "w": Qt.CursorShape.SizeHorCursor,
+        "ne": Qt.CursorShape.SizeBDiagCursor,
+        "sw": Qt.CursorShape.SizeBDiagCursor,
+        "nw": Qt.CursorShape.SizeFDiagCursor,
+        "se": Qt.CursorShape.SizeFDiagCursor,
+    }
+
+    def __init__(self, edge: str, parent=None):
         super().__init__(parent)
-        self.setFixedSize(16, 16)
-        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self._edge = edge
+        self.setCursor(self._CURSORS[edge])
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._drag_pos = None
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor(0, 0, 0, 60))
-        pen.setWidth(1)
-        painter.setPen(pen)
-        # Draw grip dots
-        for i in range(3):
-            for j in range(3):
-                if i + j >= 2:
-                    painter.drawEllipse(4 + i * 4, 4 + j * 4, 2, 2)
-        painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint()
+            event.accept()
 
     def mouseMoveEvent(self, event):
-        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
-            delta = event.globalPosition().toPoint() - self._drag_pos
-            self._drag_pos = event.globalPosition().toPoint()
-            win = self.window()
-            new_w = max(MIN_WIDTH, win.width() + delta.x())
-            new_h = max(MIN_HEIGHT, win.height() + delta.y())
-            win.resize(new_w, new_h)
+        if self._drag_pos is None or not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        cur = event.globalPosition().toPoint()
+        dx = cur.x() - self._drag_pos.x()
+        dy = cur.y() - self._drag_pos.y()
+        self._drag_pos = cur
+        win = self.window()
+        g = win.geometry()
+        x, y, width, height = g.x(), g.y(), g.width(), g.height()
+        edge = self._edge
+        if "e" in edge:
+            width = max(MIN_WIDTH, width + dx)
+        if "w" in edge:
+            new_width = max(MIN_WIDTH, width - dx)
+            x += width - new_width
+            width = new_width
+        if "s" in edge:
+            height = max(MIN_HEIGHT, height + dy)
+        if "n" in edge:
+            new_height = max(MIN_HEIGHT, height - dy)
+            y += height - new_height
+            height = new_height
+        win.setGeometry(x, y, width, height)
+        event.accept()
 
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
         win = self.window()
         if hasattr(win, "save_geometry"):
             win.save_geometry()
+        event.accept()
 
 
 # ── Checklist editor (real per-item rows) ─────────────────────────────
@@ -1325,7 +1566,7 @@ class ChecklistRow(QFrame):
         self.line.setStyleSheet(
             "QLineEdit { background: transparent; border: none; padding: 2px; }"
         )
-        self.line.setFont(QFont("Segoe UI", 10))
+        self.line.setFont(QFont("Segoe UI", round(_scaled_pt(BASE_CHECKLIST_PT))))
         self.line.textEdited.connect(self._on_text_edited)
         self.line.enter_pressed.connect(self._on_enter)
         self.line.backspace_at_start.connect(self._on_backspace_at_start)
@@ -1481,6 +1722,12 @@ class ChecklistEditor(QScrollArea):
 
     def get_items(self) -> list[dict]:
         return [r.to_dict() for r in self._rows]
+
+    def set_font_scale(self):
+        """Re-apply the current global FONT_SCALE to every row's text."""
+        pt = round(_scaled_pt(BASE_CHECKLIST_PT))
+        for r in self._rows:
+            r.line.setFont(QFont("Segoe UI", pt))
 
     def focus_first_empty(self):
         for r in self._rows:
@@ -1877,6 +2124,11 @@ class NoteWindow(QWidget):
         self.title_bar.set_pinned(pinned)
         inner.addWidget(self.title_bar)
 
+        # Extra drag surface — the title bar proper is mostly consumed
+        # by the editable title field and action buttons.
+        self.title_drag_sliver = TitleDragSliver(self)
+        inner.addWidget(self.title_drag_sliver)
+
         # Text body
         self.text_edit = NoteTextEdit(self)
         if html and not list_items:
@@ -1907,15 +2159,25 @@ class NoteWindow(QWidget):
         # Connect text changed AFTER setting initial content
         self.text_edit.textChanged.connect(self._on_text_changed)
 
-        # Bottom bar with resize grip
+        # Bottom bar
         bottom = QHBoxLayout()
-        bottom.setContentsMargins(8, 2, 2, 2)
+        bottom.setContentsMargins(8, 2, 8, 2)
         self.char_count = QLabel("")
-        self.char_count.setStyleSheet("color: rgba(0,0,0,0.3); font-size: 9px; background: transparent;")
         bottom.addWidget(self.char_count, stretch=1)
-        self.resize_grip = ResizeGrip(self)
-        bottom.addWidget(self.resize_grip)
         inner.addLayout(bottom)
+
+        # Resize handles — thin overlay strips floating on top of the
+        # container along all 4 edges and 4 corners, so the window can
+        # be resized from any side (not just the old bottom-right grip).
+        # Positioned manually in _position_resize_handles(), not via a
+        # layout, so they can sit above whatever widget occupies that
+        # row underneath.
+        self._resize_handles = {
+            edge: EdgeResizeHandle(edge, self)
+            for edge in ("n", "s", "e", "w", "ne", "nw", "se", "sw")
+        }
+        for handle in self._resize_handles.values():
+            handle.raise_()
 
         # Drop shadow
         shadow = QGraphicsDropShadowEffect(self)
@@ -2011,11 +2273,8 @@ class NoteWindow(QWidget):
         # buttons all use light text/icons against the dark background.
         self.title_bar.set_dark(self._dark_mode)
         self.fmt_toolbar.set_dark(self._dark_mode)
-        cc_color = ("rgba(255,255,255,0.45)" if self._dark_mode
-                    else "rgba(0,0,0,0.3)")
-        self.char_count.setStyleSheet(
-            f"color: {cc_color}; font-size: 9px; background: transparent;"
-        )
+        self.title_drag_sliver.set_dark(self._dark_mode)
+        self._apply_char_count_style()
         # Recolour the per-window taskbar icon to match the note.
         try:
             from app_icon import make_icon as _make_icon
@@ -2046,6 +2305,16 @@ class NoteWindow(QWidget):
             count = len(self.text_edit.toPlainText())
         self.char_count.setText(f"{count} chars")
 
+    def _apply_char_count_style(self):
+        """(Re)apply the char-count label's colour/size for the current
+        dark mode + font scale. Single source of truth — called from
+        __init__, _apply_color, and refresh_font_scale."""
+        cc_color = ("rgba(255,255,255,0.45)" if self._dark_mode
+                    else "rgba(0,0,0,0.3)")
+        self.char_count.setStyleSheet(
+            f"color: {cc_color}; font-size: {_scaled_px(BASE_CHARCOUNT_PX)}px; background: transparent;"
+        )
+
     def _on_close(self):
         self.hide()
         self.note_hidden.emit(self.note_id)
@@ -2073,6 +2342,37 @@ class NoteWindow(QWidget):
         self._dark_mode = dark_mode
         self._apply_color(self._color_hex)
 
+    def refresh_font_scale(self):
+        """Re-apply the current global note_window.FONT_SCALE to every
+        font in this already-open window — title, toolbar, checklist
+        rows, and the note body.
+
+        Body/heading text sizes are baked into each character run's
+        QTextCharFormat (not just a default widget font), so a plain
+        setFont() call wouldn't touch already-typed text. Instead this
+        round-trips the body through html_to_styled_doc/set_styled_doc —
+        the same faithful cursor-based renderer used on note refresh —
+        which rebuilds every run's font size fresh from the (now
+        rescaled) heading/body constants.
+        """
+        self.title_bar.set_font_scale()
+        self.fmt_toolbar.set_font_scale()
+        self.checklist_editor.set_font_scale()
+        self.text_edit.setFont(QFont("Segoe UI", round(_scaled_pt(BASE_BODY_PT))))
+        if not self._is_list:
+            from keep_sync_v2 import html_to_styled_doc
+            doc = html_to_styled_doc(self.text_edit.toHtml())
+            self._syncing = True
+            try:
+                self.text_edit.set_styled_doc(doc)
+            finally:
+                # Deferred clear — see end_sync_render. A synchronous
+                # clear here leaked exactly the phantom note_changed
+                # (and downstream dirty-mark/push) that end_sync_render
+                # exists to suppress everywhere else.
+                self.end_sync_render()
+        self._apply_char_count_style()
+
     @property
     def dark_mode(self) -> bool:
         return self._dark_mode
@@ -2093,7 +2393,7 @@ class NoteWindow(QWidget):
             self._is_list = False
             self._syncing = True
             self.text_edit.setPlainText("\n".join(lines))
-            self._syncing = False
+            self.end_sync_render()
             self.checklist_editor.setVisible(False)
             self.text_edit.setVisible(True)
             self.fmt_toolbar.setVisible(True)
@@ -2108,7 +2408,7 @@ class NoteWindow(QWidget):
             self._is_list = True
             self._syncing = True
             self.checklist_editor.set_items(items)
-            self._syncing = False
+            self.end_sync_render()
             self.text_edit.setVisible(False)
             self.checklist_editor.setVisible(True)
             self.fmt_toolbar.setVisible(False)
@@ -2161,38 +2461,70 @@ class NoteWindow(QWidget):
         try:
             self.checklist_editor.set_items(items)
         finally:
-            self._syncing = False
+            self.end_sync_render()
+
+    def end_sync_render(self):
+        """Clear the ``_syncing`` suppression flag on the NEXT event-loop
+        pass, not synchronously.
+
+        The link syntax highlighter (and Qt's layout engine) emit a
+        final ``textChanged`` one event-loop tick AFTER a programmatic
+        render call returns. Clearing ``_syncing`` synchronously left
+        that late signal unguarded, so every sync-driven refresh was
+        misread as a user edit: it overwrote the freshly-adopted server
+        HTML with Qt's verbose toHtml() form, re-marked the note dirty,
+        and made the next periodic pull see a phantom formatting diff —
+        an infinite refresh/push loop on formatted notes."""
+        QTimer.singleShot(0, self._clear_syncing)
+
+    def _clear_syncing(self):
+        self._syncing = False
 
     def _set_checklist_html(self, list_items):
         """Render checkbox list items as HTML with checkbox characters.
         Unchecked items appear first, checked items below."""
         sorted_items = sorted(list_items, key=lambda x: x["checked"])
+        bullet_px = _scaled_px(BASE_BULLET_PX)
         lines = []
         for item in sorted_items:
             mark = "☑" if item["checked"] else "☐"
             text = item["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             if item["checked"]:
                 lines.append(
-                    f'<p style="color:#888;"><span style="font-size:14px;">{mark}</span>'
+                    f'<p style="color:#888;"><span style="font-size:{bullet_px}px;">{mark}</span>'
                     f' <s>{text}</s></p>'
                 )
             else:
                 lines.append(
-                    f'<p><span style="font-size:14px;">{mark}</span> {text}</p>'
+                    f'<p><span style="font-size:{bullet_px}px;">{mark}</span> {text}</p>'
                 )
         self._syncing = True
-        self.text_edit.setHtml("".join(lines))
-        self._syncing = False
+        try:
+            self.text_edit.setHtml("".join(lines))
+        finally:
+            self.end_sync_render()
+        # This is a USER-initiated re-render (checkbox toggled →
+        # re-sorted), not a sync pull — the content change must reach
+        # the controller. Emit explicitly: the _syncing suppression
+        # above exists only to skip the intermediate setHtml signals,
+        # and before end_sync_render existed this path leaned on the
+        # highlighter's late textChanged (the phantom-edit bug) to get
+        # captured at all.
+        self.note_changed.emit(self.note_id)
 
     def set_text(self, text):
         self._syncing = True
-        self.text_edit.setPlainText(text)
-        self._syncing = False
+        try:
+            self.text_edit.setPlainText(text)
+        finally:
+            self.end_sync_render()
 
     def set_html(self, html):
         self._syncing = True
-        self.text_edit.setHtml(html)
-        self._syncing = False
+        try:
+            self.text_edit.setHtml(html)
+        finally:
+            self.end_sync_render()
 
     def set_title(self, title):
         self._syncing = True
@@ -2204,7 +2536,20 @@ class NoteWindow(QWidget):
             # beginning when the field isn't focused.
             if not self.title_bar.title_edit.hasFocus():
                 self.title_bar.title_edit.setCursorPosition(0)
-        self._syncing = False
+        # Deferred clear (see end_sync_render), not a synchronous
+        # `self._syncing = False`. _refresh_window calls set_title
+        # immediately after a guarded content render (set_styled_doc/
+        # set_html/set_text), which relies on _syncing staying True
+        # until the highlighter's late textChanged has had its
+        # one-event-loop-tick chance to fire and be suppressed. A
+        # synchronous clear here reopened that exact window early:
+        # set_title's own unconditional clear ran WITHIN the same
+        # synchronous call stack as the content render, well before
+        # the next tick, so the late signal landed with _syncing
+        # already False and was misread as a real user edit --
+        # re-marking the note dirty and dropping its just-adopted
+        # styled_doc cache even though the user never touched it.
+        self.end_sync_render()
         self._update_window_title(title)
 
     def save_geometry(self):
@@ -2223,7 +2568,36 @@ class NoteWindow(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "_resize_handles"):
+            self._position_resize_handles()
         self._schedule_geometry_save()
+
+    def _position_resize_handles(self):
+        m = _RESIZE_MARGIN
+        w = self.width()
+        h = self.height()
+        handles = self._resize_handles
+        handles["nw"].setGeometry(0, 0, m, m)
+        handles["ne"].setGeometry(w - m, 0, m, m)
+        handles["sw"].setGeometry(0, h - m, m, m)
+        handles["se"].setGeometry(w - m, h - m, m, m)
+        # The north strip stops short of the pin/colour/close buttons
+        # (~28px each + spacing + margin, reserved on the right) so a
+        # click near the top of those buttons isn't intercepted by the
+        # resize strip instead — those buttons are vertically centred
+        # in the 32px title bar, so their top few pixels sit inside
+        # the handle's y-range across its full width otherwise.
+        button_row_reserve = 100
+        handles["n"].setGeometry(
+            m, 0, max(0, w - m - button_row_reserve), m,
+        )
+        handles["s"].setGeometry(m, h - m, max(0, w - 2 * m), m)
+        # Left/right edges start below the title bar so they don't steal
+        # clicks from the pin/colour/close buttons that live there.
+        top_y = self.title_bar.height()
+        side_h = max(0, h - top_y - m)
+        handles["w"].setGeometry(0, top_y, m, side_h)
+        handles["e"].setGeometry(w - m, top_y, m, side_h)
 
     def _schedule_geometry_save(self):
         # Debounce: many move/resize events fire per drag, but we only

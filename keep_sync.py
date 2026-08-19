@@ -126,7 +126,9 @@ class KeepSync:
             log.error("Token exchange failed: %s", exc)
             return None
 
-    def fetch_notes(self, force_resync: bool = False) -> list[KeepNote]:
+    def fetch_notes(
+        self, force_resync: bool = False, hold_baseline_for=None,
+    ) -> list[KeepNote]:
         """Pull all non-trashed notes from Keep.
 
         gkeepapi's incremental sync (`keep.sync()`) is known to miss remote
@@ -134,6 +136,18 @@ class KeepSync:
         because they can be applied without bumping the timestamps the
         delta-sync relies on. We therefore force a full resync
         (`keep.sync(True)`) to guarantee remote changes are picked up.
+
+        `hold_baseline_for` — accepted (and ignored) purely so this
+        stays a drop-in replacement for KeepSyncV2.fetch_notes(),
+        whose caller (AppController._sync_worker) always passes it.
+        This v1/gkeepapi backend has no per-note baseline-tracking
+        concept for it to gate: without accepting the kwarg, an
+        installation running v1 (config keep_protocol_v2=False, or a
+        KeepSyncV2 init failure falling back to v1) would raise
+        TypeError on every single periodic/manual sync -- silently
+        swallowed by _sync_worker's broad exception handler, which
+        degrades that install to push-only forever, with only a log
+        line and no user-visible error.
         """
         if not self._authenticated:
             return []

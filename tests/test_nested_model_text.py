@@ -18,6 +18,8 @@ from keep_protocol.nested_model import (
     StyledDoc,
     decode_chunks,
     encode_text_diff,
+    styled_doc_from_dict,
+    styled_doc_to_dict,
 )
 
 
@@ -108,6 +110,81 @@ def test_text_diff_targets_correct_sct():
         assert target[2] == "sct.AAA"
 
 
+def test_text_diff_emits_style_op_for_untouched_paragraph_restyled():
+    """Regression: a pure formatting change (no text edit) on a
+    paragraph that ISN'T where the SAME push also edited text used to
+    be silently dropped -- only headings were exempted from the
+    "must fall inside a text-changed range" gate; run-level bold/
+    italic/underline/strikethrough was not. Bolding one paragraph
+    while typing in another, in the same autosave, lost the bold on
+    the next pull."""
+    old = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="hello")]),
+        Paragraph(runs=[StyleRun(text="world")]),
+    ])
+    new = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="helloX")]),  # text edit here
+        Paragraph(runs=[StyleRun(text="world", bold=True)]),  # style-only here
+    ])
+    ops = encode_text_diff(old, new)
+    bold_ops = [
+        op for op in ops
+        if op[2].get("ty") == "as" and op[2].get("st") == "text"
+        and op[2].get("sm", {}).get("ts_bd") is True
+    ]
+    assert bold_ops, "bold change on the untouched paragraph must not be dropped"
+
+
+def test_text_diff_heading_clear_detected_despite_paragraph_count_change():
+    """Regression: heading-clear detection used to compare
+    old_doc.paragraphs[p_idx] against doc.paragraphs[p_idx] by raw
+    index, and skipped clear-detection for the WHOLE document
+    whenever paragraph counts merely differed elsewhere -- so
+    clearing a heading while ALSO adding an unrelated new paragraph
+    in the same push silently kept the old heading server-side."""
+    old = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="Title")], heading=1, heading_id="h.abc"),
+        Paragraph(runs=[StyleRun(text="body")]),
+    ])
+    new = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="Title")], heading=0),  # cleared
+        Paragraph(runs=[StyleRun(text="body")]),
+        Paragraph(runs=[StyleRun(text="new para")]),  # count changed
+    ])
+    ops = encode_text_diff(old, new)
+    clear_ops = [
+        op for op in ops
+        if op[2].get("ty") == "as" and op[2].get("st") == "paragraph"
+        and op[2].get("sm", {}).get("ps_hd") == 0
+    ]
+    assert clear_ops, "heading clear must not be dropped by an unrelated paragraph-count change"
+
+
+def test_text_diff_reuses_heading_id_instead_of_reminting():
+    """Regression: html_to_styled_doc (the editor -> push path) never
+    populates Paragraph.heading_id, so the old code's `para.heading_id
+    or _mint_heading_id()` minted a BRAND NEW heading anchor id on
+    every single push that touched any text in a note containing a
+    heading -- even though the heading itself never changed. Must
+    reuse the id already known server-side (from old_doc) instead."""
+    old = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="Title")], heading=1, heading_id="h.abc123"),
+        Paragraph(runs=[StyleRun(text="body")]),
+    ])
+    new = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="Title")], heading=1, heading_id=None),
+        Paragraph(runs=[StyleRun(text="bodyX")]),
+    ])
+    ops = encode_text_diff(old, new)
+    heading_ops = [
+        op for op in ops
+        if op[2].get("ty") == "as" and op[2].get("st") == "paragraph"
+        and "ps_hd" in op[2].get("sm", {})
+    ]
+    assert heading_ops, "expected a heading op even though the heading itself is unchanged"
+    assert heading_ops[0][2]["sm"]["ps_hdid"] == "h.abc123"
+
+
 def test_text_diff_requires_sct_id():
     old = StyledDoc(paragraphs=[Paragraph(runs=[StyleRun(text="x")])])
     new = StyledDoc(paragraphs=[Paragraph(runs=[StyleRun(text="xy")])])
@@ -148,3 +225,51 @@ def test_text_diff_back_to_front_walk_preserves_offsets():
     # Recover (text, position) pairs.
     pairs = sorted((o[2]["s"], o[2]["ibi"]) for o in is_ops)
     assert pairs == [("B", 2), ("D", 3)]
+
+
+# ---------------------------------------------------------- styled_doc persistence
+
+def test_styled_doc_json_round_trip_preserves_all_fields():
+    """Regression: styled_doc is a dynamically-attached (non-dataclass)
+    KeepNote attribute that was never persisted to the disk cache,
+    meaning it was absent on every single app restart -- not just
+    after a fresh local edit. sync_merge.py's decide_merge uses
+    "local has no styled_doc" as a signal for "this is our own push
+    echoing back, suppress the refresh" (see its local_doc-is-None
+    branch); with styled_doc never surviving a restart, that
+    heuristic misfired on literally every note's first sync after
+    launch, silently swallowing any concurrent web restyle."""
+    import json
+
+    doc = StyledDoc(sct_id="sct.x", revision="5", paragraphs=[
+        Paragraph(runs=[StyleRun(text="Heading", bold=True)], heading=1, heading_id="h.abc"),
+        Paragraph(runs=[
+            StyleRun(text="body ", italic=True),
+            StyleRun(text="text", underline=True),
+        ]),
+        Paragraph(runs=[]),  # blank paragraph
+    ])
+
+    # Must be JSON-serializable (this is what actually hits notes.json).
+    d = json.loads(json.dumps(styled_doc_to_dict(doc)))
+    doc2 = styled_doc_from_dict(d)
+
+    assert doc2.sct_id == "sct.x"
+    assert doc2.revision == "5"
+    assert len(doc2.paragraphs) == 3
+    assert doc2.paragraphs[0].heading == 1
+    assert doc2.paragraphs[0].heading_id == "h.abc"
+    assert doc2.paragraphs[0].runs[0].bold is True
+    assert doc2.paragraphs[1].runs[0].italic is True
+    assert doc2.paragraphs[1].runs[1].underline is True
+    assert doc2.paragraphs[2].runs == []
+    assert doc2.plain_text == doc.plain_text
+
+
+def test_styled_doc_from_dict_degrades_gracefully_on_bad_input():
+    """A corrupt or old-format cache entry must fall back to "no
+    baseline yet" (the pre-existing behavior) rather than crashing
+    the whole disk-cache load."""
+    assert styled_doc_from_dict(None) is None
+    assert styled_doc_from_dict("not a dict") is None  # type: ignore[arg-type]
+    assert styled_doc_from_dict({"paragraphs": [{"heading": 0, "runs": []}]}) is not None

@@ -29,6 +29,7 @@ from .nested_model import (
     decode_checkboxes,
     decode_chunks,
     encode_full_replace,
+    u16_len,
     encode_list_diff,
     encode_replace_list,
     encode_text_diff,
@@ -86,6 +87,14 @@ class KeepClient:
         # Numeric session id used inside commandBundles (Keep web uses a
         # 19-digit int, distinct from clientSessionId).
         self._bundle_session_id = str(secrets.randbelow(2**63 - 1))
+        # Notes where an incremental delta bumped the snapshot revision
+        # but didn't echo serializedChunks (Keep does this on compact/
+        # metadata-only deltas — including, apparently, paragraph-style
+        # ops like a heading change with no text edit). We keep the old
+        # chunks rather than guess, which means our cached content is
+        # stale relative to the new revision. Surfaced via
+        # pop_stale_snapshot_ids() so callers can schedule a full resync.
+        self._stale_snapshot_ids: set[str] = set()
 
     # -------------------------------------------------------------- internal
 
@@ -132,6 +141,81 @@ class KeepClient:
         }
 
     # ------------------------------------------------------------------ sync
+
+    def _merge_node_delta(self, nid: str, n: dict,
+                          *, update_revision: bool = True) -> None:
+        """Merge one server-echoed node delta into ``self.notes``.
+
+        BOTH endpoints return node DELTAS — only the fields that
+        changed. The read path (/changes) has always merged carefully;
+        the write path used a bare ``merged.update(n)``, which is wrong
+        in two ways that between them make a concurrent web edit
+        invisible until the app is restarted:
+
+          * ``update()`` overwrites "serverChanges" wholesale whenever
+            the key is present at all — even when its inner snapshot is
+            empty or degenerate — silently wiping serializedChunks; and
+          * a compact delta (revision bumped, chunks not re-echoed) was
+            not flagged in ``_stale_snapshot_ids``, so
+            KeepSyncV2.fetch_notes never scheduled the full resync that
+            repairs it.
+
+        That matters far more on the write path than it looks, because
+        a write also advances ``target_version``. Once the cursor moves
+        past a change whose content we failed to absorb, no later
+        INCREMENTAL sync will ever mention that note again — the server
+        is right to consider it already delivered. The note then sits
+        frozen at its stale content through every periodic poll and
+        every manual "Sync now" (both incremental), and only a restart
+        — whose first fetch is full — brings it back.
+        """
+        existing = self.notes.get(nid)
+        if existing is None or not existing.raw:
+            fresh = Note.from_server(n)
+            if fresh.type in ("NOTE", "LIST"):
+                self.notes[nid] = fresh
+                self._stale_snapshot_ids.discard(nid)
+            return
+
+        merged = dict(existing.raw)
+        merged.update(n)
+        new_sc = n.get("serverChanges") or {}
+        new_snap = new_sc.get("snapshot") or {}
+        new_rev = new_snap.get("revision")
+        # `is not None`, not truthiness: a snapshot that legitimately
+        # echoes serializedChunks: [] (the note's text was fully
+        # emptied) is a REAL, authoritative empty snapshot.
+        new_chunks = new_snap.get("serializedChunks")
+        old_sc = existing.raw.get("serverChanges") or {}
+        old_snap = old_sc.get("snapshot") or {}
+        old_rev = old_snap.get("revision")
+
+        if new_chunks is not None:
+            merged["serverChanges"] = new_sc
+            self._stale_snapshot_ids.discard(nid)
+        elif new_rev and new_rev != old_rev:
+            merged_snap = dict(old_snap)
+            merged_snap["revision"] = new_rev
+            merged_sc = dict(old_sc)
+            merged_sc["snapshot"] = merged_snap
+            merged["serverChanges"] = merged_sc
+            self._stale_snapshot_ids.add(nid)
+        elif old_sc:
+            merged["serverChanges"] = old_sc
+        elif "serverChanges" in merged:
+            del merged["serverChanges"]
+
+        self.notes[nid] = Note.from_server(merged)
+        if update_revision and new_rev:
+            # Next write should use the server's current revision, not
+            # our post-last-write counter. Write paths pass
+            # update_revision=False: they have already committed their
+            # own (client_revision + op_count) bookkeeping, which the
+            # server's echoed value must not clobber mid-sequence.
+            try:
+                self._client_revision[nid] = int(new_rev)
+            except (TypeError, ValueError):
+                pass
 
     def sync(self, full: bool = False) -> dict[str, Any]:
         """Pull changes from the server. Returns the raw response of
@@ -203,56 +287,7 @@ class KeepClient:
                     # merge the delta into its raw payload so unchanged
                     # fields like serializedChunks / indexableText /
                     # sct_id survive.
-                    existing = self.notes.get(nid)
-                    if existing is not None and existing.raw:
-                        merged = dict(existing.raw)
-                        merged.update(n)
-                        # serverChanges is itself a dict that needs
-                        # deep merge so we don't blow away the snapshot
-                        # just because the delta omits it.
-                        if ("serverChanges" not in n
-                                and existing.raw.get("serverChanges")):
-                            merged["serverChanges"] = existing.raw["serverChanges"]
-                        # If the delta brings a new serverChanges with
-                        # a different revision than what we cached,
-                        # the cached serializedChunks are stale by
-                        # definition. Drop them so the decoder doesn't
-                        # run on outdated ops.
-                        new_sc = n.get("serverChanges") or {}
-                        new_snap = (new_sc.get("snapshot") or {})
-                        new_rev = new_snap.get("revision")
-                        new_chunks = new_snap.get("serializedChunks")
-                        old_sc = existing.raw.get("serverChanges") or {}
-                        old_rev = (old_sc.get("snapshot") or {}).get("revision")
-                        if new_rev and new_rev != old_rev:
-                            # Server gave us an updated snapshot. Trust
-                            # it entirely ONLY if it actually carries
-                            # chunks — an empty/missing chunk list
-                            # means "revision bumped but the snapshot
-                            # blob wasn't echoed in this delta" (Keep
-                            # does this on metadata-only writes). In
-                            # that case keep the old chunks but adopt
-                            # the new revision so writes use it.
-                            if new_chunks:
-                                merged["serverChanges"] = n["serverChanges"]
-                            else:
-                                merged_sc = dict(old_sc)
-                                merged_snap = dict(merged_sc.get("snapshot") or {})
-                                merged_snap["revision"] = new_rev
-                                merged_sc["snapshot"] = merged_snap
-                                merged["serverChanges"] = merged_sc
-                        self.notes[nid] = Note.from_server(merged)
-                        # Reset our local revision tracker too — next
-                        # write should use the server's current
-                        # revision, not our post-last-write counter
-                        # (which is now stale).
-                        if new_rev:
-                            try:
-                                self._client_revision[nid] = int(new_rev)
-                            except (TypeError, ValueError):
-                                pass
-                    else:
-                        self.notes[nid] = Note.from_server(n)
+                    self._merge_node_delta(nid, n)
                 elif ntype == "LIST_ITEM":
                     parent = self.notes.get(n.get("parentId", ""))
                     if parent and parent.type == "LIST":
@@ -278,11 +313,38 @@ class KeepClient:
         if full:
             for stale_id in [nid for nid in self.notes if nid not in ids_seen_this_sync]:
                 self.notes.pop(stale_id, None)
+                self._stale_snapshot_ids.discard(stale_id)
 
         if forced_resync:
             log.info("v2 sync: server requested forceFullResync; rebuilt cache")
 
         return last_data
+
+    def pop_stale_snapshot_ids(self) -> set[str]:
+        """Return and clear the set of note ids whose cached
+        serializedChunks are known stale (revision bumped but the
+        server's incremental delta didn't re-echo the snapshot blob).
+        Callers should schedule a full resync for these — see
+        KeepSyncEngine.fetch_notes.
+
+        Draining: this is meant for the ONE caller (fetch_notes) that
+        sweeps and repairs every stale note each cycle. A caller that
+        only cares about ONE specific note id (push_note's pre-push
+        staleness check) must use is_snapshot_stale() instead —
+        draining the whole set here for a single-note check would
+        silently discard OTHER notes' staleness signal before
+        fetch_notes ever gets to see it, defeating its protection for
+        notes this caller was never even asking about.
+        """
+        ids, self._stale_snapshot_ids = self._stale_snapshot_ids, set()
+        return ids
+
+    def is_snapshot_stale(self, note_id: str) -> bool:
+        """Non-draining membership check — does NOT clear the shared
+        set, unlike pop_stale_snapshot_ids(). Safe to call for a
+        single note of interest without discarding other notes'
+        pending staleness flags."""
+        return note_id in self._stale_snapshot_ids
 
     def list_notes(self, include_archived: bool = False, include_trashed: bool = False) -> list[Note]:
         """Return cached notes. Calls sync() if cache is empty."""
@@ -337,7 +399,12 @@ class KeepClient:
         # targets the right text container.
         new_doc.sct_id = note.sct_id
 
-        current_len = len(note.indexable_text or note.text or "")
+        # UTF-16 code units, not Python characters: the `ds` this length
+        # drives has to cover the WHOLE existing text, and an astral
+        # character (any emoji) counts as two units server-side. A
+        # codepoint length would leave the final surrogate undeleted and
+        # the rebuilt text would be appended after that orphan.
+        current_len = u16_len(note.indexable_text or note.text or "")
         ops = encode_full_replace(new_doc, current_len)
         if not ops:
             raise KeepError("encoder produced no ops")
@@ -423,7 +490,22 @@ class KeepClient:
         # (client_revision + N ops); next write should use that value.
         self._client_revision[note.id] = client_revision + len(ops)
         self._next_request_id[note.id] = request_id + 1
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         # Refresh the cache from the response. The write-side response is
         # a *delta* — it only echoes back fields that changed. We merge
         # rather than replace so we don't lose serializedChunks etc.
@@ -431,15 +513,7 @@ class KeepClient:
             nid = n.get("id")
             if not nid:
                 continue
-            existing = self.notes.get(nid)
-            if existing:
-                merged = dict(existing.raw)
-                merged.update(n)
-                self.notes[nid] = Note.from_server(merged)
-            else:
-                fresh = Note.from_server(n)
-                if fresh.type in ("NOTE", "LIST"):
-                    self.notes[nid] = fresh
+            self._merge_node_delta(nid, n, update_revision=False)
         return data
 
     # ------------------------------------------------------------ list write
@@ -570,20 +644,27 @@ class KeepClient:
         # not the docs-mlti wrapper count.
         self._client_revision[note.id] = client_revision + len(ops)
         self._next_request_id[note.id] = request_id + 1
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         for n in data.get("nodes", []):
             nid = n.get("id")
             if not nid:
                 continue
-            existing_n = self.notes.get(nid)
-            if existing_n:
-                merged = dict(existing_n.raw)
-                merged.update(n)
-                self.notes[nid] = Note.from_server(merged)
-            else:
-                fresh = Note.from_server(n)
-                if fresh.type in ("NOTE", "LIST"):
-                    self.notes[nid] = fresh
+            self._merge_node_delta(nid, n, update_revision=False)
         return data
 
     # ------------------------------------------------------------ collab-friendly diffs
@@ -779,20 +860,27 @@ class KeepClient:
         data = self._post(CHANGES_URL_WRITE, body)
         self._client_revision[note.id] = client_revision + inner_count
         self._next_request_id[note.id] = request_id + 1
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         for n in data.get("nodes", []):
             nid = n.get("id")
             if not nid:
                 continue
-            existing_n = self.notes.get(nid)
-            if existing_n:
-                merged = dict(existing_n.raw)
-                merged.update(n)
-                self.notes[nid] = Note.from_server(merged)
-            else:
-                fresh = Note.from_server(n)
-                if fresh.type in ("NOTE", "LIST"):
-                    self.notes[nid] = fresh
+            self._merge_node_delta(nid, n, update_revision=False)
         return data
 
     # ------------------------------------------------------------ metadata write
@@ -851,19 +939,27 @@ class KeepClient:
             body["targetVersion"] = self.target_version
 
         data = self._post(CHANGES_URL_WRITE, body)
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         for n in data.get("nodes", []):
             nid = n.get("id")
             if not nid:
                 continue
-            existing = self.notes.get(nid)
-            if existing:
-                merged = dict(existing.raw)
-                merged.update(n)
-                if ("serverChanges" not in n
-                        and existing.raw.get("serverChanges")):
-                    merged["serverChanges"] = existing.raw["serverChanges"]
-                self.notes[nid] = Note.from_server(merged)
+            self._merge_node_delta(nid, n, update_revision=False)
         if is_pinned is not None:
             note.is_pinned = bool(is_pinned)
             if isinstance(note.raw, dict):
@@ -928,28 +1024,36 @@ class KeepClient:
             body["targetVersion"] = self.target_version
 
         data = self._post(CHANGES_URL_WRITE, body)
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         for n in data.get("nodes", []):
             nid = n.get("id")
             if not nid:
                 continue
-            existing = self.notes.get(nid)
-            if existing:
-                merged = dict(existing.raw)
-                merged.update(n)
-                if ("serverChanges" not in n
-                        and existing.raw.get("serverChanges")):
-                    merged["serverChanges"] = existing.raw["serverChanges"]
-                # Server frequently strips `text`/`indexableText` from
-                # the response. Echo the value we just sent so the
-                # in-memory cache reflects what's now on the server.
-                if nid == note.id:
-                    if not (merged.get("text") or "").strip() and new_text:
-                        merged["text"] = new_text
-                    if (not (merged.get("indexableText") or "").strip()
-                            and new_text):
-                        merged["indexableText"] = new_text
-                self.notes[nid] = Note.from_server(merged)
+            # Server frequently strips `text`/`indexableText` from the
+            # response. Echo the value we just sent so the in-memory
+            # cache doesn't lie about content until the next sync.
+            if nid == note.id and new_text:
+                n = dict(n)
+                if not (n.get("text") or "").strip():
+                    n["text"] = new_text
+                if not (n.get("indexableText") or "").strip():
+                    n["indexableText"] = new_text
+            self._merge_node_delta(nid, n, update_revision=False)
         return data
 
     # ------------------------------------------------------------ sct bootstrap
@@ -1135,7 +1239,22 @@ class KeepClient:
         if self.target_version:
             body["targetVersion"] = self.target_version
         data = self._post(CHANGES_URL_WRITE, body)
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         # Pull the canonical version of the new note from the response
         # if the server echoed it back; otherwise build one from what
         # we sent so callers get something sensible immediately.
@@ -1190,13 +1309,19 @@ class KeepClient:
             # couldn't recover it from chunks.
             if not promoted.sct_id and sct_id_minted:
                 promoted.sct_id = sct_id_minted
+            # position carries INDENT into encode_replace_list, which
+            # rebuilds the real [parent, child] paths from it. A flat
+            # (i,) for every row (what this used to pass) threw the
+            # user's sub-items away on the very first sync of a
+            # newly-created checklist.
             cbx_items = [
                 CheckboxItem(
                     cbx_id="",  # always mint fresh; the bootstrap row
                                 # is wiped via existing_ids_override
                     text=str(it.get("text", "") or ""),
                     checked=bool(it.get("checked", False)),
-                    position=(i,),
+                    position=((i,) if not min(1, int(it.get("indent", 0) or 0))
+                              else (0, 0)),
                 )
                 for i, it in enumerate(list_items)
             ]
@@ -1265,7 +1390,22 @@ class KeepClient:
         if self.target_version:
             body["targetVersion"] = self.target_version
         data = self._post(CHANGES_URL_WRITE, body)
-        self.target_version = data.get("toVersion") or self.target_version
+        # Deliberately NOT advancing self.target_version here.
+        # target_version is the cursor recording "we have processed
+        # every change up to this version". Only sync() can honestly
+        # claim that: it LOOPS over pages until the response stops
+        # setting "truncated", merging each one. A write response is
+        # a single unpaginated payload that echoes whatever the server
+        # felt like including, so adopting its toVersion asserts we
+        # absorbed changes we may never have been shown — and once the
+        # cursor is past them, no later INCREMENTAL sync mentions them
+        # again (the server is right to consider them delivered). A
+        # concurrent web edit lost that way stays invisible through
+        # every periodic poll AND every manual "Sync now", until the
+        # app is restarted and its first fetch runs full.
+        # Leaving the cursor where it is costs only a little repeated
+        # echo on the next sync, which _merge_node_delta absorbs
+        # idempotently.
         # Drop the trashed note from our cache so subsequent list_notes
         # calls don't show it (matches the read-side filter).
         self.notes.pop(note.id, None)

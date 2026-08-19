@@ -16,6 +16,7 @@ from keep_protocol.nested_model import (
     CheckboxItem,
     decode_checkboxes,
     encode_list_diff,
+    encode_replace_list,
 )
 
 
@@ -340,3 +341,62 @@ def test_list_diff_full_top_level_reorder_uses_sequential_mvs():
         dst = mv[3][0]
         state.insert(dst, state.pop(src))
     assert state == ["cbx.c", "cbx.a", "cbx.b"]
+
+# ---------------------------------------------------------------- nesting
+
+def test_encode_replace_list_preserves_indentation():
+    """A checkbox's indent lives ONLY in its cbx-add position path:
+    top-level rows are [i], children are [parent_i, child_i], and
+    decode_checkboxes reads the tree position straight back out of it.
+
+    encode_replace_list used to emit a flat [idx] for every row, so
+    seeding a brand-new checklist — the one path that reaches it, via
+    KeepClient.replace_list_items during LIST bootstrap — silently
+    flattened every sub-item to top level on the very first sync.
+    """
+    items = [
+        _item("cbx.a", "parent", position=(0,)),
+        _item("cbx.b", "child", position=(0, 0)),
+        _item("cbx.c", "next parent", position=(2,)),
+    ]
+    ops = encode_replace_list(SCT, [], items)
+    adds = {op[2]: op[3] for op in ops if op[0] == "cbx-add"}
+    assert adds["cbx.a"] == [0]
+    assert adds["cbx.b"] == [0, 0], "child must keep a [parent, child] path"
+    assert adds["cbx.c"] == [2]
+
+    decoded, _ = decode_checkboxes([json.dumps(ops)], SCT)
+    assert [(i.text, i.indent) for i in decoded] == [
+        ("parent", 0), ("child", 1), ("next parent", 0)]
+
+
+def test_encode_replace_list_flat_list_is_unchanged():
+    """The nesting-aware scheme must reduce to the old flat [idx] for a
+    list with no indentation at all."""
+    items = [_item("cbx.a", "x", position=(0,)),
+             _item("cbx.b", "y", position=(1,)),
+             _item("cbx.c", "z", position=(2,))]
+    ops = encode_replace_list(SCT, [], items)
+    adds = [op[3] for op in ops if op[0] == "cbx-add"]
+    assert adds == [[0], [1], [2]]
+
+
+def test_encode_replace_list_promotes_a_leading_child():
+    """A child with no parent above it would 400; force it top-level."""
+    items = [_item("cbx.a", "orphan", position=(0, 0)),
+             _item("cbx.b", "next", position=(1,))]
+    ops = encode_replace_list(SCT, [], items)
+    adds = [op[3] for op in ops if op[0] == "cbx-add"]
+    assert adds[0] == [0]
+
+
+def test_encode_replace_list_numbers_consecutive_children():
+    """Two children of the same parent must be [p,0] and [p,1] — not
+    [p,0] twice, and not a 2-level path like [1,2] that Keep rejects."""
+    items = [_item("cbx.a", "parent", position=(0,)),
+             _item("cbx.b", "c1", position=(0, 0)),
+             _item("cbx.c", "c2", position=(0, 0))]
+    ops = encode_replace_list(SCT, [], items)
+    adds = [op[3] for op in ops if op[0] == "cbx-add"]
+    assert adds == [[0], [0, 0], [0, 1]]
+

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QDialog,
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QMessageBox, QFrame, QScrollArea, QWidget, QCheckBox, QSizePolicy,
+    QTabWidget, QComboBox,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile
@@ -23,6 +24,7 @@ from config import (
     load_json, save_json, APP_NAME, APP_VERSION, GITHUB_REPO,
 )
 from app_icon import make_icon as _make_icon
+import note_window
 from note_window import NoteWindow
 from keep_sync import KeepSync, KeepNote
 from updater import UpdateChecker, prompt_and_install
@@ -30,6 +32,13 @@ from updater import UpdateChecker, prompt_and_install
 log = logging.getLogger(__name__)
 
 VISIBILITY_FILE = os.path.join(DATA_DIR, "visibility.json")
+
+# How many periodic sync ticks between full resyncs. A full resync is
+# the only thing that reliably surfaces a formatting-only web edit (see
+# _periodic_sync), so run it often enough to feel responsive while any
+# note is on screen, and rarely when nothing is.
+_FULL_RESYNC_TICKS_ACTIVE = 4      # ~2 minutes at the 30s interval
+_FULL_RESYNC_TICKS_IDLE = 20       # ~10 minutes
 
 
 def _set_window_app_id(window, app_id: str) -> None:
@@ -518,6 +527,19 @@ class LoginDialog(QDialog):
 #  Note Manager Dialog
 # ═══════════════════════════════════════════════════════════════════════
 
+class _NoWheelComboBox(QComboBox):
+    """QComboBox that ignores mouse-wheel scrolling.
+
+    Qt's default QComboBox changes selection on every wheel tick even
+    without the dropdown open — idly scrolling a Settings page while
+    the cursor happens to pass over this combo silently changes the
+    value. Used for the font-scale picker, where each change triggers
+    a disk write and a full re-render of every open note window."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class NoteManagerDialog(QDialog):
     """Modal to manage which notes appear on the desktop."""
 
@@ -527,8 +549,12 @@ class NoteManagerDialog(QDialog):
     checklist_toggle_requested = Signal(str)  # note_id
     pin_toggle_requested = Signal(str)        # note_id (Keep is_pinned)
     reorder_requested = Signal(str, str)      # note_id, action: top|up|down|bottom
+    font_scale_changed = Signal(float)        # new global font scale
 
-    def __init__(self, notes: dict, visibility: dict, parent=None):
+    # Presets offered in the Settings tab's font-scale picker.
+    _FONT_SCALE_PRESETS = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
+
+    def __init__(self, notes: dict, visibility: dict, font_scale: float = 1.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("KeepDesktop – Manage Notes")
         self.setMinimumSize(500, 480)
@@ -541,8 +567,15 @@ class NoteManagerDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
+        tabs = QTabWidget(self)
+        layout.addWidget(tabs, stretch=1)
+
+        notes_page = QWidget()
+        notes_layout = QVBoxLayout(notes_page)
+        notes_layout.setSpacing(8)
+
         header = QLabel("<b>Choose which notes to show on your desktop:</b>")
-        layout.addWidget(header)
+        notes_layout.addWidget(header)
 
         # Search bar + New note button row
         search_row = QHBoxLayout()
@@ -562,7 +595,7 @@ class NoteManagerDialog(QDialog):
         )
         new_btn.clicked.connect(self.note_create_requested.emit)
         search_row.addWidget(new_btn)
-        layout.addLayout(search_row)
+        notes_layout.addLayout(search_row)
 
         # Quick-select row
         quick_row = QHBoxLayout()
@@ -573,7 +606,7 @@ class NoteManagerDialog(QDialog):
         sel_none.clicked.connect(lambda: self._set_all(False))
         quick_row.addWidget(sel_none)
         quick_row.addStretch()
-        layout.addLayout(quick_row)
+        notes_layout.addLayout(quick_row)
 
         # Scrollable note list
         scroll = QScrollArea()
@@ -589,7 +622,10 @@ class NoteManagerDialog(QDialog):
         self.refresh(notes, visibility)
 
         scroll.setWidget(scroll_widget)
-        layout.addWidget(scroll, stretch=1)
+        notes_layout.addWidget(scroll, stretch=1)
+
+        tabs.addTab(notes_page, "Notes")
+        tabs.addTab(self._build_settings_page(font_scale), "Settings")
 
         # Bottom buttons
         btn_row = QHBoxLayout()
@@ -605,6 +641,50 @@ class NoteManagerDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+
+    # ── Settings tab ─────────────────────────────────────────────────
+
+    def _build_settings_page(self, font_scale: float) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setSpacing(8)
+        page_layout.setContentsMargins(12, 12, 12, 12)
+
+        label = QLabel("<b>Text size</b>")
+        page_layout.addWidget(label)
+        hint = QLabel(
+            "Scales the body, heading, and toolbar text in every note "
+            "window — turn it up on a 4K display, or down to fit more "
+            "on screen. Applies immediately to open notes."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        page_layout.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Note text size:"))
+        self._font_scale_combo = _NoWheelComboBox()
+        closest = min(
+            self._FONT_SCALE_PRESETS, key=lambda p: abs(p - font_scale)
+        )
+        for preset in self._FONT_SCALE_PRESETS:
+            self._font_scale_combo.addItem(f"{round(preset * 100)}%", preset)
+        self._font_scale_combo.setCurrentIndex(
+            self._FONT_SCALE_PRESETS.index(closest)
+        )
+        self._font_scale_combo.currentIndexChanged.connect(
+            self._on_font_scale_selected
+        )
+        row.addWidget(self._font_scale_combo)
+        row.addStretch()
+        page_layout.addLayout(row)
+        page_layout.addStretch()
+        return page
+
+    def _on_font_scale_selected(self, index: int):
+        scale = self._font_scale_combo.itemData(index)
+        if scale is not None:
+            self.font_scale_changed.emit(float(scale))
 
     # ── Row construction / refresh ─────────────────────────────────────
 
@@ -889,10 +969,15 @@ class AppController(QObject):
     """Orchestrates note windows, tray icon, and Keep sync."""
 
     _remote_notes_ready = Signal(list)
+    _note_merged_during_push = Signal(str)  # note_id
 
     def __init__(self):
         super().__init__()
         self.config = load_config()
+        # Apply the saved text-size preference before any NoteWindow is
+        # built so freshly-opened notes render at the right scale from
+        # the start (not just ones open when the setting later changes).
+        note_window.set_font_scale(self.config.get("font_scale", 1.0))
         # Reconcile the autostart flag with reality. The Inno Setup
         # installer creates a Startup-folder shortcut directly without
         # touching our config, so a fresh install would otherwise show
@@ -923,6 +1008,46 @@ class AppController(QObject):
         self.windows: dict[str, NoteWindow] = {}
         self._notes: dict[str, KeepNote] = {}
         self._dirty: set[str] = set()
+        # Notes whose CACHE (self._notes[id].text/.html/.styled_doc)
+        # was just updated -- by push_note's merge result, or by a
+        # remote pull the user was too busy to have applied to their
+        # widget immediately -- but whose WIDGET hasn't been confirmed
+        # refreshed to match yet (the refresh is deferred: queued via
+        # a cross-thread signal for the push case, or retried on a
+        # timer until idle for the busy-pull case). Included in
+        # hold_baseline_for alongside self._dirty and busy_ids so
+        # KeepSyncV2's fetch_notes() doesn't advance _base_text/
+        # _base_doc to the server's latest before the widget has
+        # actually caught up -- a note in this gap is neither dirty
+        # nor busy, so without tracking it explicitly here, the very
+        # next periodic sync cycle's fetch would treat the widget's
+        # (still-stale) content as if it were the confirmed baseline,
+        # and the next local edit would silently revert the
+        # just-merged/just-pulled content right back off the server.
+        self._pending_widget_refresh: set[str] = set()
+        # Per-note record of the StyledDoc actually rendered into the
+        # window. decide_merge needs a local structured view to spot a
+        # formatting-only remote change (plain text can't reveal one),
+        # and note.styled_doc can't serve: _on_note_changed clears it on
+        # every body edit, so between a local edit and the next pull it
+        # is simply absent -- and a formatting-only web change landing
+        # in that gap got written into the cache but never rendered,
+        # after which no later pull ever saw a difference to refresh
+        # for. What the window is SHOWING is the honest thing to
+        # compare against, and it survives local edits.
+        self._rendered_doc: dict = {}
+        # Periodic-sync counter driving the adaptive full-resync
+        # cadence in _periodic_sync.
+        self._tick_count = 0
+        # Re-entrancy guard shared between _push_dirty_notes (the
+        # debounced post-edit push) and _sync_worker's own push phase
+        # -- deliberately separate from _sync_running, which guards
+        # _full_sync's entire push+pull cycle. See _push_dirty_notes'
+        # own comment for why conflating the two starves the periodic
+        # pull (the only path that brings in web edits) during active
+        # typing, when the debounced push fires far more often than
+        # the 30s periodic tick.
+        self._push_running = False
         # Notes the user just deleted locally for which the threaded
         # `sync.delete_note` trash POST hasn't yet completed. We must
         # ignore these in `_apply_remote_notes`, otherwise a periodic
@@ -953,6 +1078,7 @@ class AppController(QObject):
 
         # Marshal remote-note results from worker thread back to GUI thread
         self._remote_notes_ready.connect(self._apply_remote_notes)
+        self._note_merged_during_push.connect(self._refresh_window_when_idle)
 
         # Load persisted notes from disk
         self._load_notes_from_disk()
@@ -1086,9 +1212,10 @@ class AppController(QObject):
 
     def _save_notes_to_disk(self):
         from config import NOTES_FILE
+        from keep_protocol.nested_model import styled_doc_to_dict
         data = {}
         for nid, note in self._notes.items():
-            data[nid] = {
+            entry = {
                 "id": note.id,
                 "title": note.title,
                 "text": note.text,
@@ -1101,10 +1228,21 @@ class AppController(QObject):
                 "local_order": note.local_order,
                 "dark_mode": note.dark_mode,
             }
+            # Persisting styled_doc means the very first sync after
+            # launch has a real baseline to structurally compare
+            # against, instead of "no styled_doc yet" being
+            # indistinguishable from "we just pushed our own edit" --
+            # see decide_merge's local_doc-is-None handling in
+            # sync_merge.py, and styled_doc_to_dict's own docstring.
+            sdoc = getattr(note, "styled_doc", None)
+            if sdoc is not None:
+                entry["styled_doc"] = styled_doc_to_dict(sdoc)
+            data[nid] = entry
         save_json(NOTES_FILE, data)
 
     def _load_notes_from_disk(self):
         from config import NOTES_FILE
+        from keep_protocol.nested_model import styled_doc_from_dict
         data = load_json(NOTES_FILE, {})
         log.info("Loading %d notes from disk cache (%s)",
                  len(data), NOTES_FILE)
@@ -1122,6 +1260,9 @@ class AppController(QObject):
                 local_order=d.get("local_order", 0),
                 dark_mode=d.get("dark_mode", False),
             )
+            sdoc = styled_doc_from_dict(d.get("styled_doc"))
+            if sdoc is not None:
+                note.styled_doc = sdoc  # type: ignore[attr-defined]
             self._notes[nid] = note
             if nid not in self._visibility:
                 self._visibility[nid] = True
@@ -1168,7 +1309,9 @@ class AppController(QObject):
             try:
                 win.text_edit.set_styled_doc(sdoc)
             finally:
-                win._syncing = False
+                # Deferred clear — the highlighter's late textChanged
+                # must not read as a user edit (see end_sync_render).
+                win.end_sync_render()
         win.note_changed.connect(self._on_note_changed)
         win.note_hidden.connect(self._on_note_hidden)
         win.note_deleted.connect(self._on_note_deleted)
@@ -1216,15 +1359,27 @@ class AppController(QObject):
         win = self.windows.get(note_id)
         note = self._notes.get(note_id)
         if win and note:
+            text_before, html_before = note.text, note.html
             note.text = win.get_text()
             note.title = win.get_title()
             note.color_hex = win.color_hex
             note.dark_mode = bool(getattr(win, "dark_mode", False))
             note.html = win.get_html()
-            # Local edit invalidates any cached server-decoded
-            # StyledDoc — drop it so a refresh doesn't overwrite
-            # the user's in-flight typing with stale render.
-            if hasattr(note, "styled_doc"):
+            # A local edit to the BODY invalidates any cached server-
+            # decoded StyledDoc — drop it so a refresh doesn't
+            # overwrite the user's in-flight typing with stale render.
+            # Gated on the body actually changing (not e.g. a title-
+            # only or colour-only edit, which also routes through
+            # this same handler): styled_doc absence is also how
+            # sync_merge.py's decide_merge tells "local just echoed
+            # its own push back" apart from "a genuine concurrent web
+            # restyle arrived" (see its local_doc-is-None branch) --
+            # clearing it for edits that never touched the body made
+            # that heuristic wrong far more often than intended,
+            # silently swallowing a concurrent web restyle whenever it
+            # landed in the same cycle as an unrelated title/colour
+            # edit.
+            if (note.text != text_before or note.html != html_before) and hasattr(note, "styled_doc"):
                 try:
                     delattr(note, "styled_doc")
                 except AttributeError:
@@ -1260,6 +1415,7 @@ class AppController(QObject):
     def _on_note_deleted(self, note_id):
         win = self.windows.pop(note_id, None)
         note = self._notes.pop(note_id, None)
+        self._rendered_doc.pop(note_id, None)
         self._visibility.pop(note_id, None)
         self._dirty.discard(note_id)
         _save_visibility(self._visibility)
@@ -1417,7 +1573,10 @@ class AppController(QObject):
             except RuntimeError:
                 # Dialog was deleted from under us — fall through to recreate.
                 self._manager_dlg = None
-        dlg = NoteManagerDialog(self._notes, self._visibility)
+        dlg = NoteManagerDialog(
+            self._notes, self._visibility,
+            font_scale=self.config.get("font_scale", 1.0),
+        )
         dlg.setModal(False)
         dlg.note_deleted.connect(self._on_note_deleted)
         dlg.note_create_requested.connect(self._new_note)
@@ -1425,6 +1584,7 @@ class AppController(QObject):
         dlg.checklist_toggle_requested.connect(self._toggle_note_checklist)
         dlg.pin_toggle_requested.connect(self._toggle_note_pin)
         dlg.reorder_requested.connect(self._reorder_note)
+        dlg.font_scale_changed.connect(self._on_font_scale_changed)
         dlg.accepted.connect(lambda: self._on_manager_accepted(dlg))
         dlg.rejected.connect(lambda: self._on_manager_closed())
         dlg.finished.connect(lambda _r: self._on_manager_closed())
@@ -1461,6 +1621,13 @@ class AppController(QObject):
 
     def _on_manager_closed(self):
         self._manager_dlg = None
+
+    def _on_font_scale_changed(self, scale: float):
+        self.config["font_scale"] = scale
+        save_config(self.config)
+        note_window.set_font_scale(scale)
+        for win in self.windows.values():
+            win.refresh_font_scale()
 
     def _refresh_manager_if_open(self):
         dlg = getattr(self, "_manager_dlg", None)
@@ -1696,7 +1863,17 @@ class AppController(QObject):
             QMessageBox.information(None, "KeepDesktop", "Signed in! Your notes are syncing.")
             QTimer.singleShot(500, self._show_note_manager_if_not_open)
 
-    def _full_sync(self):
+    def _full_sync(self, force_resync: bool = False):
+        """Run one push+pull cycle in the background.
+
+        `force_resync` promotes the pull to a full resync. The periodic
+        tick leaves it False (an incremental delta is all it needs);
+        user-triggered "Sync now" passes True, because the whole point
+        of pressing it is "I know something changed over there, go and
+        get it" — and an incremental pull can only ever return what the
+        cursor says is new, which is exactly nothing when the cursor
+        has already moved past the change.
+        """
         if not self.sync.is_authenticated:
             return
         # Re-entrancy guard: a slow sync (large pull, retry, etc) can
@@ -1706,29 +1883,56 @@ class AppController(QObject):
             log.debug("_full_sync: previous sync still running; skipping")
             return
         self._sync_running = True
-        threading.Thread(target=self._sync_worker, daemon=True).start()
+        # _is_note_busy() reads QWidget.hasFocus(), which must stay on
+        # the GUI thread — compute it here, before handing off to the
+        # background thread, rather than inside _sync_worker.
+        busy_ids = {nid for nid in self.windows if self._is_note_busy(nid)}
+        threading.Thread(target=self._sync_worker,
+                         args=(busy_ids, force_resync), daemon=True).start()
 
-    def _sync_worker(self):
+    def _sync_worker(self, busy_ids: set, force_resync: bool = False):
         try:
-            # Push dirty notes first
-            for note_id in list(self._dirty):
-                note = self._notes.get(note_id)
-                if note:
-                    try:
-                        ok = self.sync.push_note(note)
-                    except Exception:  # noqa: BLE001
-                        log.exception("push_note crashed for %s", note_id[:8])
-                        ok = False
-                    # Keep the note in _dirty if push failed so we retry
-                    # next sync. Otherwise the local edit is silently lost.
-                    if ok is not False:
-                        self._dirty.discard(note_id)
-                else:
-                    self._dirty.discard(note_id)
-
-            # Pull remote notes
+            # Push dirty notes first — via the shared, race-safe
+            # helper (see _push_one_dirty_note) so a note edited while
+            # ITS push is in flight isn't silently marked clean here
+            # too. This loop used to have its own inline copy of the
+            # push logic, predating that fix, so the exact race it
+            # closes was still fully reachable every 30s via this
+            # periodic/manual sync path even after the debounce path
+            # (_push_dirty_worker) was fixed.
+            #
+            # _push_running (NOT _sync_running) guards just this push
+            # phase against _push_dirty_notes' own background thread
+            # touching the same self._dirty set concurrently — see
+            # _push_running's own comment for why this must be a
+            # SEPARATE flag from _sync_running, scoped to end before
+            # the pull below starts.
+            self._push_running = True
             try:
-                remote_notes = self.sync.fetch_notes()
+                for note_id in list(self._dirty):
+                    self._push_one_dirty_note(note_id)
+            finally:
+                self._push_running = False
+
+            # Pull remote notes. Notes that are still dirty (push
+            # above didn't clear them), whose window is busy, or whose
+            # cache was just updated but hasn't reached the widget yet
+            # (self._pending_widget_refresh -- a merge-during-push
+            # result queued for the main thread, or a busy-deferred
+            # remote pull still waiting for idle) won't have this
+            # fetch's content applied to their widget right away (see
+            # _apply_remote_notes) — hold their push-merge baseline
+            # back too, or a genuine concurrent web restyle would look
+            # identical to "no remote change" once the editor finally
+            # catches up, and the next local push would silently
+            # overwrite it right back off the server.
+            try:
+                remote_notes = self.sync.fetch_notes(
+                    force_resync=force_resync,
+                    hold_baseline_for=(
+                        self._dirty | busy_ids | self._pending_widget_refresh
+                    ),
+                )
             except Exception:  # noqa: BLE001
                 log.exception("fetch_notes crashed; skipping pull this cycle")
                 remote_notes = []
@@ -1768,18 +1972,14 @@ class AppController(QObject):
                 existing.sort_key = rn.sort_key
                 existing.pinned = rn.pinned
                 # Compute merge decision with the user's editing state.
-                win = self.windows.get(rn.id)
-                last_edit = self._last_edit_time.get(rn.id, 0.0)
-                idle_for = time.monotonic() - last_edit
-                user_busy = bool(
-                    win and win.text_edit.hasFocus()
-                    and idle_for < self._edit_idle_seconds
-                )
+                idle_for = time.monotonic() - self._last_edit_time.get(rn.id, 0.0)
+                user_busy = self._is_note_busy(rn.id)
                 decision = decide_merge(
                     local=existing,
                     remote=rn,
                     is_dirty=(rn.id in self._dirty),
                     user_busy=user_busy,
+                    local_rendered_doc=self._rendered_doc.get(rn.id),
                 )
 
                 if decision.action is MergeAction.SKIP_DIRTY:
@@ -1812,9 +2012,10 @@ class AppController(QObject):
                         rn.id[:8], len(existing.text or ""),
                     )
                     # Still adopt safe metadata (title, colour, pin).
+                    # dark_mode is a per-device rendering preference, not
+                    # part of Keep's data model — never let a remote
+                    # colour change override it (see ADOPT_REMOTE below).
                     existing.title = rn.title
-                    if decision.color_changed:
-                        existing.dark_mode = False
                     existing.color_hex = rn.color_hex
                     continue
 
@@ -1841,18 +2042,35 @@ class AppController(QObject):
                     except AttributeError:
                         pass
                 existing.title = rn.title
-                if decision.color_changed:
-                    # User changed colour on the web → drop our local
-                    # dark-mode override so we follow the new colour.
-                    existing.dark_mode = False
+                # dark_mode is a per-device rendering preference — it's
+                # never sent to Keep (the wire colour is always the light
+                # hex, see config.KEEP_COLORS_DARK), so a remote colour
+                # change (from the web, or from this same note open on
+                # another computer) must not touch it. Forcing it off
+                # here used to reset every other open instance of this
+                # note back to its light variant on the very next pull.
                 existing.color_hex = rn.color_hex
                 existing.list_items = rn.list_items
                 existing.is_list = rn.is_list
                 if user_busy:
+                    # The cache (existing.*) is already updated above,
+                    # but the open window can't be safely re-rendered
+                    # over active typing. Without a retry, this remote
+                    # change is never shown: decide_merge() compares
+                    # against `existing`, which now already matches
+                    # `rn`, so no future pull ever sees a difference to
+                    # refresh for again — and if the user's next
+                    # keystroke re-derives note.text/.html from the
+                    # (still stale) widget before that, their push
+                    # would silently overwrite this remote change right
+                    # back off the server. Retry once idle instead of
+                    # dropping it.
                     log.info(
-                        "Skipping refresh for %s (user editing, idle %.1fs)",
+                        "Deferring refresh for %s (user editing, idle %.1fs)",
                         rn.id[:8], idle_for,
                     )
+                    self._pending_widget_refresh.add(rn.id)
+                    self._refresh_window_when_idle(rn.id)
                 elif decision.refresh_window:
                     log.info("Refreshing window %s", rn.id[:8])
                     self._refresh_window(rn.id)
@@ -1893,6 +2111,7 @@ class AppController(QObject):
                 log.info("Note %s removed remotely; deleting locally", nid[:8])
                 self._missing_strikes.pop(nid, None)
                 self._notes.pop(nid, None)
+                self._rendered_doc.pop(nid, None)
                 self._visibility.pop(nid, None)
                 win = self.windows.pop(nid, None)
                 if win:
@@ -1915,21 +2134,134 @@ class AppController(QObject):
     def _push_dirty_notes(self):
         if not self.sync.is_authenticated or not self._dirty:
             return
+        # Dedicated re-entrancy guard (_push_running), deliberately
+        # NOT _sync_running: this (the debounced post-edit push) and
+        # _sync_worker's own "push dirty notes first" step both call
+        # the same _push_one_dirty_note for whatever's currently in
+        # self._dirty, from two INDEPENDENT background threads with no
+        # mutual exclusion between them -- redundant concurrent pushes
+        # of the same note_id would race on app_controller-level
+        # bookkeeping (dirty-clearing, _pending_widget_refresh,
+        # _note_merged_during_push emission) that KeepSyncV2's own
+        # internal lock doesn't cover.
+        #
+        # _sync_running was tried here first and reverted: _full_sync
+        # guards its ENTIRE cycle (push AND pull) with it, so shared
+        # would mean a debounced push in flight -- which fires on
+        # every edit during active typing, far more often than the
+        # 30s periodic tick -- blocks that periodic cycle's pull
+        # phase too, starving fetch_notes() during exactly the
+        # "actively editing while a web change also landed" scenario
+        # this whole push/pull split exists to handle correctly. This
+        # flag only ever gates the push phase (see _sync_worker's own
+        # scoped use of it), never the pull.
+        if getattr(self, "_push_running", False):
+            log.debug("_push_dirty_notes: a push is already running; skipping")
+            return
+        self._push_running = True
         threading.Thread(target=self._push_dirty_worker, daemon=True).start()
 
     def _push_dirty_worker(self):
-        for note_id in list(self._dirty):
-            note = self._notes.get(note_id)
-            if note:
-                try:
-                    ok = self.sync.push_note(note)
-                except Exception:  # noqa: BLE001
-                    log.exception("push_note crashed for %s", note_id[:8])
-                    ok = False
-                if ok is not False:
-                    self._dirty.discard(note_id)
+        try:
+            for note_id in list(self._dirty):
+                self._push_one_dirty_note(note_id)
+        finally:
+            self._push_running = False
+
+    def _push_one_dirty_note(self, note_id: str):
+        """Push a single dirty note, race-safely. Caller must be on a
+        background thread (this blocks on network I/O via push_note).
+
+        Shared by both push triggers — the debounced post-edit push
+        AND the periodic/manual full-sync's own "push dirty notes
+        first" step — so the mid-push race protection below applies
+        regardless of which one happens to fire. It used to live only
+        in the debounce path; the periodic-sync path had its own
+        unguarded copy of this same loop, so the exact race this
+        method exists to prevent was still fully reachable every 30s
+        via that path even after the debounce path was fixed.
+        """
+        note = self._notes.get(note_id)
+        if not note:
+            self._dirty.discard(note_id)
+            return
+        # push_note's 3-way / format-preserving merge paths can
+        # rewrite note.text/.html in place to fold in a concurrent
+        # remote edit — from THIS (background) thread. The open
+        # window has no idea that happened and keeps showing only
+        # what the user typed; worse, the user's very next keystroke
+        # re-derives note.text from the (stale) widget and clobbers
+        # the merge before it's ever seen. Detect the mutation and
+        # ask the GUI thread to refresh the window so the merge
+        # actually reaches the screen.
+        text_before, html_before = note.text, note.html
+        # push_note is network-bound (it does its own full resync
+        # before writing) and can easily take several seconds, all on
+        # this background thread, while _on_note_changed keeps
+        # mutating this SAME note object from the main thread on
+        # every keystroke. If the user types more mid-push, what
+        # we're about to send doesn't include that edit.
+        push_started_at = time.monotonic()
+        try:
+            ok = self.sync.push_note(note)
+        except Exception:  # noqa: BLE001
+            log.exception("push_note crashed for %s", note_id[:8])
+            ok = False
+        if ok is not False:
+            edited_during_push = (
+                self._last_edit_time.get(note_id, 0.0) > push_started_at
+            )
+            if edited_during_push:
+                # Don't clear dirty — the edit that landed while this
+                # push was in flight was never sent. Without this
+                # check we'd mark the note clean anyway, and since
+                # nothing else ever re-dirties a note on its own, that
+                # edit would silently never sync: no further push
+                # would carry it, and the next periodic pull (no
+                # longer blocked by SKIP_DIRTY, since dirty was
+                # cleared) would overwrite the cached text with the
+                # server's older copy. Leave it dirty so the next push
+                # cycle sends the CURRENT widget content instead.
+                log.info(
+                    "v2 push: %s edited again mid-push; keeping "
+                    "dirty for another push cycle", note_id[:8],
+                )
             else:
                 self._dirty.discard(note_id)
+            if note.text != text_before or note.html != html_before:
+                # Mark BEFORE emitting: the signal is queued to the
+                # main thread's event loop and may not be processed
+                # for a while, but a periodic sync's fetch_notes()
+                # (running on ANOTHER background thread) could fire in
+                # that gap -- see _pending_widget_refresh's own
+                # comment for why that must not advance this note's
+                # baseline yet.
+                self._pending_widget_refresh.add(note_id)
+                self._note_merged_during_push.emit(note_id)
+
+    def _refresh_window_when_idle(self, note_id: str):
+        """Render self._notes[note_id]'s current content into its open
+        window, retrying later if the user is busy right now.
+
+        Shared by two callers that both adopt new content into the
+        note cache (push_note's merge result, or a remote pull) without
+        being able to touch the widget immediately: stomping active
+        typing with a snapshot computed before the user's last few
+        keystrokes would lose those keystrokes. The cache is already
+        correct by the time this is called — whenever the refresh
+        actually lands is still correct, just possibly delayed.
+        """
+        win = self.windows.get(note_id)
+        note = self._notes.get(note_id)
+        if not win or not note:
+            return
+        if self._is_note_busy(note_id):
+            QTimer.singleShot(
+                int(self._edit_idle_seconds * 1000),
+                lambda: self._refresh_window_when_idle(note_id),
+            )
+            return
+        self._refresh_window(note_id)
 
     def _add_window_for_note(self, note: KeepNote):
         if note.id in self.windows:
@@ -1945,6 +2277,34 @@ class AppController(QObject):
         win = self.windows.get(note_id)
         note = self._notes.get(note_id)
         if win and note:
+            # set_styled_doc/set_html/set_text below all clear() and
+            # rebuild the document from scratch, which resets the
+            # scrollbar to the top — jarring if the user was reading
+            # further down when a sync (even a no-op one that just
+            # re-confirms unchanged content) happened to land.
+            # Restore the scroll position afterward; deferred one
+            # event-loop tick so the widget's layout — and thus its
+            # scrollbar range — has settled onto the new content
+            # first (a synchronous restore can land before Qt has
+            # recomputed the range for the new document length).
+            scrollbar = win.text_edit.verticalScrollBar()
+            saved_scroll = scrollbar.value()
+            if saved_scroll:
+                def _restore_scroll(sb=scrollbar, v=saved_scroll):
+                    # The note (or its window) can be closed/deleted
+                    # in the gap between scheduling this and the next
+                    # event-loop tick actually running it (e.g. the
+                    # user closes the note right after a remote pull
+                    # triggers this refresh) -- sb would then be a
+                    # dangling wrapper around an already-destroyed Qt
+                    # C++ scrollbar, and touching it raises
+                    # "wrapped C/C++ object ... has been deleted"
+                    # from inside a timer callback.
+                    try:
+                        sb.setValue(v)
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(0, _restore_scroll)
             win._is_list = note.is_list
             win.set_dark_mode(note.dark_mode)
             if note.is_list and note.list_items:
@@ -1961,7 +2321,10 @@ class AppController(QObject):
                 try:
                     win.text_edit.set_styled_doc(note.styled_doc)
                 finally:
-                    win._syncing = False
+                    # Deferred clear — the highlighter's late
+                    # textChanged must not read as a user edit.
+                    win.end_sync_render()
+                self._rendered_doc[note_id] = note.styled_doc
                 win.checklist_editor.setVisible(False)
                 win.text_edit.setVisible(True)
                 win.fmt_toolbar.setVisible(True)
@@ -1978,6 +2341,14 @@ class AppController(QObject):
                 win.fmt_toolbar.setVisible(True)
             win.set_title(note.title)
             win._apply_color(note.color_hex)
+            # The widget now actually reflects the cache -- see
+            # _pending_widget_refresh's own comment for why a periodic
+            # sync's fetch_notes() must not advance this note's
+            # baseline before this point. Cleared at the END (not the
+            # top of this method) so an exception partway through the
+            # render above leaves the note correctly still marked
+            # pending rather than wrongly treated as caught up.
+            self._pending_widget_refresh.discard(note_id)
 
     def _manual_sync(self):
         if not self.sync.is_authenticated:
@@ -2006,14 +2377,42 @@ class AppController(QObject):
             log.info("Manual sync: cleared local_order on %d notes", cleared)
             self._save_notes_to_disk()
             self._refresh_manager_if_open()
-        self._full_sync()
+        self._full_sync(force_resync=True)
 
     def _periodic_sync(self):
-        if self.sync.is_authenticated:
-            log.info("Periodic sync tick")
-            self._full_sync()
+        """Timer-driven sync.
 
-    # ── Settings ───────────────────────────────────────────────────────
+        Most ticks are incremental — that is all a text edit needs. But
+        a FORMATTING-ONLY change on the web (bold, italic, a heading)
+        moves no text at all: it lives entirely in the note's
+        docs-nestedModel snapshot, and if a delta bumps the revision
+        without re-echoing that snapshot there is nothing in the
+        response to compare against. Only a full resync surfaces it.
+
+        So fold one in periodically, and pick the cadence by whether the
+        user can actually see anything: with note windows open a stale
+        note is visibly wrong, so check every few minutes; with
+        everything closed there is nothing to be wrong on screen, so
+        back off and keep the request count down. This is the cheap
+        version of "only check open notes" — the pull is one bulk
+        request either way, so what is worth tuning is how OFTEN it
+        runs, not which notes it covers.
+        """
+        if not self.sync.is_authenticated:
+            return
+        self._tick_count += 1
+        anything_visible = any(
+            w.isVisible() for w in self.windows.values()
+        )
+        every = (_FULL_RESYNC_TICKS_ACTIVE if anything_visible
+                 else _FULL_RESYNC_TICKS_IDLE)
+        force = (self._tick_count % every) == 0
+        if force:
+            log.info("Periodic sync tick (full resync; %s)",
+                     "windows open" if anything_visible else "all closed")
+        else:
+            log.info("Periodic sync tick")
+        self._full_sync(force_resync=force)
 
     def _toggle_autostart(self, enabled):
         ok = set_autostart(enabled)
@@ -2032,7 +2431,49 @@ class AppController(QObject):
     # ── Updates ────────────────────────────────────────────────────────
 
     def _on_update_available(self, info):
-        prompt_and_install(None, info)
+        if self._any_window_busy():
+            # Don't pop a modal over someone's typing — Qt hands the
+            # very next keypress to the new dialog's focused button, so
+            # a keystroke meant for the note (Enter/Space) can silently
+            # trigger "Update now" instead. Retry shortly instead.
+            QTimer.singleShot(10000, lambda: self._on_update_available(info))
+            return
+        if getattr(self, "_update_prompt_open", False):
+            # The startup check's retry and a manual "Check for
+            # updates" click can both resolve around the same time —
+            # don't stack a second modal on top of one already showing.
+            return
+        self._update_prompt_open = True
+        try:
+            prompt_and_install(None, info)
+        finally:
+            self._update_prompt_open = False
+
+    def _is_note_busy(self, note_id: str) -> bool:
+        """True if the user appears to be actively engaged with this
+        note's window right now — recently edited it AND either the
+        body or the title field currently has keyboard focus. Used to
+        avoid interrupting in-progress editing with a sync-driven
+        refresh, a merge result, or an update prompt.
+
+        Checks the title field too, not just the body: a user typing
+        a title is just as "busy" as one typing body text, but only
+        the body was checked here originally — narrower than the
+        other two busy-checks in this class started requiring."""
+        win = self.windows.get(note_id)
+        if not win:
+            return False
+        idle_for = time.monotonic() - self._last_edit_time.get(note_id, 0.0)
+        if idle_for >= self._edit_idle_seconds:
+            return False
+        title_edit = getattr(win.title_bar, "title_edit", None)
+        return bool(
+            win.text_edit.hasFocus()
+            or (title_edit is not None and title_edit.hasFocus())
+        )
+
+    def _any_window_busy(self) -> bool:
+        return any(self._is_note_busy(note_id) for note_id in self.windows)
 
     def _manual_update_check(self):
         if self._manual_update_in_progress:
@@ -2052,7 +2493,11 @@ class AppController(QObject):
 
     def _on_manual_update_available(self, info):
         self._manual_update_in_progress = False
-        prompt_and_install(None, info)
+        # Route through the same busy-check/defer as the startup check —
+        # the network check this follows can take a few seconds, long
+        # enough for the user to have started typing since they clicked
+        # "Check for updates".
+        self._on_update_available(info)
 
     def _on_manual_no_update(self):
         self._manual_update_in_progress = False

@@ -8,9 +8,11 @@ arrived while typing", "fetch returned empty body", etc.) gets a case.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from sync_merge import MergeAction, decide_merge
+from keep_protocol.nested_model import StyledDoc, Paragraph, StyleRun
 
 
 @dataclass
@@ -22,10 +24,17 @@ class FakeNote:
     html: str = ""
     is_list: bool = False
     list_items: list = None  # type: ignore[assignment]
+    styled_doc: Optional[StyledDoc] = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.list_items is None:
             self.list_items = []
+        # KeepNote models "no styled_doc" as an ABSENT attribute
+        # (hasattr/delattr), not a None-valued one -- mirror that so
+        # decide_merge's getattr(local, "styled_doc", None) checks
+        # behave the same way here as against the real object.
+        if self.styled_doc is None:
+            del self.styled_doc
 
 
 # ------------------------------------------------------------- skip-dirty
@@ -148,3 +157,68 @@ def test_list_items_change_triggers_refresh():
     decision = decide_merge(local=local, remote=remote, is_dirty=False, user_busy=False)
     assert decision.list_changed
     assert decision.refresh_window
+
+
+# --------------------------------------------- html comparison (styled_doc)
+
+def test_html_string_mismatch_alone_is_not_a_false_positive_restyle():
+    """Regression: remote.html (our own to_html(), e.g. "<h1>x</h1>")
+    and local.html (Qt's native toHtml() output captured from the live
+    widget after any local edit, verbose with full CSS) are DIFFERENT
+    byte strings for IDENTICAL formatted content. Comparing them
+    directly false-positived html_changed on nearly every sync cycle
+    once a note had ever been locally edited, forcing a pointless
+    window refresh (and the scroll-position reset that comes with it)
+    even though nothing had actually changed. With a structured
+    styled_doc on BOTH sides showing the SAME content, the mismatched
+    raw HTML strings must not trigger a refresh."""
+    doc = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="Heading")], heading=1),
+        Paragraph(runs=[StyleRun(text="bold text", bold=True)], heading=0),
+    ])
+    local = FakeNote(
+        text=doc.plain_text,
+        html='<html><body><h1 style="font-size:16pt;">Heading</h1>'
+             '<p><span style="font-weight:700;">bold text</span></p></body></html>',
+        styled_doc=doc,
+    )
+    remote = FakeNote(text=doc.plain_text, html="<h1>Heading</h1><p><b>bold text</b></p>", styled_doc=doc)
+    decision = decide_merge(local=local, remote=remote, is_dirty=False, user_busy=False)
+    assert decision.html_changed is False
+    assert decision.refresh_window is False
+
+
+def test_html_missing_local_styled_doc_after_own_edit_is_not_a_false_positive():
+    """The common real case: local was just edited then successfully
+    pushed (styled_doc is cleared on every local keystroke -- see
+    AppController._on_note_changed -- and a normal push doesn't
+    restore it), so on the very next fetch cycle local has NO
+    styled_doc while remote (freshly fetched) always does. With no
+    reliable structured comparison available and plain text matching,
+    this must not be treated as a remote restyle -- the far more
+    likely explanation is our own edit being echoed back."""
+    doc = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="hello", bold=True)], heading=0),
+    ])
+    local = FakeNote(text=doc.plain_text, html="<html>...Qt native...</html>")  # no styled_doc
+    remote = FakeNote(text=doc.plain_text, html="<p><b>hello</b></p>", styled_doc=doc)
+    decision = decide_merge(local=local, remote=remote, is_dirty=False, user_busy=False)
+    assert decision.html_changed is False
+    assert decision.refresh_window is False
+
+
+def test_genuine_remote_restyle_still_detected_via_styled_doc():
+    """Sanity check for the fix above: when BOTH sides have a
+    styled_doc and they genuinely differ, that's still a real remote
+    restyle and must still trigger a refresh."""
+    base_doc = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="hello")], heading=0),
+    ])
+    restyled_doc = StyledDoc(sct_id="sct.x", paragraphs=[
+        Paragraph(runs=[StyleRun(text="hello", bold=True)], heading=0),
+    ])
+    local = FakeNote(text=base_doc.plain_text, html="<p>hello</p>", styled_doc=base_doc)
+    remote = FakeNote(text=restyled_doc.plain_text, html="<p><b>hello</b></p>", styled_doc=restyled_doc)
+    decision = decide_merge(local=local, remote=remote, is_dirty=False, user_busy=False)
+    assert decision.html_changed is True
+    assert decision.refresh_window is True

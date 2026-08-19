@@ -110,6 +110,9 @@ def load_config():
         # docs-nestedModel formatting state). Falls back to gkeepapi
         # when False. Default ON for new installs from 1.1.0 onward.
         "keep_protocol_v2": True,
+        # Global text-size multiplier applied across every note window
+        # (body, headings, toolbar, checklist). 1.0 = 100%.
+        "font_scale": 1.0,
     }
     saved = load_json(CONFIG_FILE, {})
     # Merge: saved values win, defaults fill in any missing keys

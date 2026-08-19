@@ -292,7 +292,14 @@ def prompt_and_install(parent, info: ReleaseInfo):
     )
     msg.button(QMessageBox.StandardButton.Yes).setText("Update now")
     msg.button(QMessageBox.StandardButton.No).setText("Later")
-    msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+    # Default to "Later", not "Update now". This dialog can appear
+    # unprompted while the user is mid-keystroke elsewhere (e.g. typing
+    # in a note) — Qt delivers the very next keypress (Enter/Space) to
+    # whichever button has focus in the new modal, so a keystroke meant
+    # for the note can silently trigger an unwanted update+restart.
+    # Defaulting to the safe/no-op choice means an accidental keypress
+    # just dismisses the prompt instead of installing anything.
+    msg.setDefaultButton(QMessageBox.StandardButton.No)
 
     if msg.exec() != QMessageBox.StandardButton.Yes:
         return

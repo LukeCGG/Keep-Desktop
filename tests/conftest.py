@@ -23,18 +23,28 @@ import pytest
 
 @pytest.fixture(scope="session")
 def qapp():
-    """Session-wide QGuiApplication for tests that need Qt internals.
+    """Session-wide QApplication for tests that need Qt internals.
+
+    A full QApplication (not just QGuiApplication) so tests that need
+    actual widgets (NoteWindow, etc.) can share the same instance too
+    — PySide6 only allows ONE QCoreApplication-derived singleton per
+    process, so a second, separately-created QApplication instance
+    later (even via `QApplication.instance() or QApplication(...)`,
+    which happily returns the mismatched existing instance) crashes
+    the whole test run rather than failing a single test. QApplication
+    is a strict superset of QGuiApplication, so this doesn't change
+    anything for tests that only needed the Gui-level features.
 
     Skips the test if PySide6 isn't importable (CI lint runner without
     full deps).
     """
     try:
-        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtWidgets import QApplication
     except ImportError:
         pytest.skip("PySide6 not installed")
-    app = QGuiApplication.instance()
+    app = QApplication.instance()
     if app is None:
-        # QGuiApplication needs argv (any list will do).
-        app = QGuiApplication([])
+        # QApplication needs argv (any list will do).
+        app = QApplication([])
     yield app
     # Don't quit — pytest may reuse it across tests in the same session.

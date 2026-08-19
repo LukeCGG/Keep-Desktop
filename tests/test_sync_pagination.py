@@ -178,6 +178,94 @@ def test_force_full_resync_restarts_loop_in_full_mode():
     assert client.target_version == "v-fresh"
 
 
+def test_incremental_delta_with_genuinely_empty_chunks_is_adopted_not_flagged_stale():
+    """Regression: the merge logic used `if new_chunks:` (truthiness)
+    to decide between "compact delta, keep old cached chunks, flag
+    stale" and "real snapshot, adopt fully". A delta that legitimately
+    echoes serializedChunks: [] (the note's text was fully emptied
+    server-side) is indistinguishable from "chunks field omitted"
+    under a truthy check -- both are falsy -- so a genuine deletion
+    got routed into the compact-delta branch: the OLD (non-empty,
+    now-stale) chunks were kept and the note was wrongly flagged
+    stale, instead of the empty state being adopted immediately."""
+    client = _new_client()
+    node = _make_note_node("note.aaa", "will-be-emptied")
+    node["serverChanges"] = {"snapshot": {
+        "revision": "1",
+        "serializedChunks": ["some-chunk-json"],
+    }}
+    page1 = {"toVersion": "v1", "truncated": False, "nodes": [node]}
+
+    empty_delta_node = {
+        "id": "note.aaa", "kind": "notes#node", "type": "NOTE",
+        "serverChanges": {"snapshot": {
+            "revision": "2",
+            "serializedChunks": [],
+        }},
+    }
+    page2 = {"toVersion": "v2", "truncated": False, "nodes": [empty_delta_node]}
+    pages = [page1, page2]
+
+    def fake_post(_url, _body):
+        return pages.pop(0)
+
+    client._post = fake_post  # type: ignore[assignment]
+    client.sync(full=True)
+    assert client.notes["note.aaa"].serialized_chunks == ["some-chunk-json"]
+
+    client.sync(full=False)
+
+    assert client.notes["note.aaa"].serialized_chunks == [], (
+        "the genuinely-empty snapshot must be adopted, not the stale cached chunks"
+    )
+    assert "note.aaa" not in client.pop_stale_snapshot_ids(), (
+        "a real (if empty) snapshot must not be flagged as a stale compact delta"
+    )
+
+
+def test_is_snapshot_stale_does_not_drain_other_notes_flags():
+    """Regression: push_note checks staleness for ONE specific note
+    right after its own pre-push resync. It used to do this via
+    pop_stale_snapshot_ids(), which DRAINS the entire shared set --
+    silently discarding any OTHER note's staleness flag that same
+    sync(full=True) call happened to also discover. That note's flag
+    would then be gone by the time fetch_notes()'s own
+    pop_stale_snapshot_ids() sweep runs later in the same periodic-
+    sync cycle, so its stale-content protection never triggers for
+    it. is_snapshot_stale() must be a non-draining peek instead."""
+    client = _new_client()
+    node_a = _make_note_node("note.a", "a")
+    node_a["serverChanges"] = {"snapshot": {"revision": "1", "serializedChunks": ["chunk"]}}
+    node_b = _make_note_node("note.b", "b")
+    node_b["serverChanges"] = {"snapshot": {"revision": "1", "serializedChunks": ["chunk"]}}
+    page1 = {"toVersion": "v1", "truncated": False, "nodes": [node_a, node_b]}
+    client._post = lambda *_a, **_k: page1
+    client.sync(full=True)
+
+    # An incremental delta flags BOTH notes stale (compact/metadata-
+    # only deltas, revision bumped, no re-echoed chunks).
+    delta_a = {"id": "note.a", "kind": "notes#node", "type": "NOTE",
+               "serverChanges": {"snapshot": {"revision": "2"}}}
+    delta_b = {"id": "note.b", "kind": "notes#node", "type": "NOTE",
+               "serverChanges": {"snapshot": {"revision": "2"}}}
+    page2 = {"toVersion": "v2", "truncated": False, "nodes": [delta_a, delta_b]}
+    client._post = lambda *_a, **_k: page2
+    client.sync(full=True)
+
+    assert client.is_snapshot_stale("note.a") is True
+    assert client.is_snapshot_stale("note.b") is True
+
+    # A push_note-style single-note check for "note.a" must NOT
+    # consume "note.b"'s flag.
+    assert client.is_snapshot_stale("note.b") is True, (
+        "checking note.a's staleness must not drain note.b's flag"
+    )
+
+    # The real drain (fetch_notes()'s sweep) must still see both.
+    drained = client.pop_stale_snapshot_ids()
+    assert drained == {"note.a", "note.b"}
+
+
 def test_incremental_sync_loops_until_not_truncated():
     """Incremental syncs paginate too — long-idle clients can have
     multiple pages of catch-up. The loop must consume all of them."""
